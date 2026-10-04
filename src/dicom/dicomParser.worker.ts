@@ -12,6 +12,8 @@ const PLANE_ORIENTATION_TAG = 'x00209116';
 const PIXEL_MEASURES_TAG = 'x00289110';
 const FRAME_VOI_LUT_TAG = 'x00289132';
 const PIXEL_VALUE_TRANSFORM_TAG = 'x00289145';
+const MEDIA_STORAGE_SOP_CLASS_TAG = 'x00020002';
+const DICOM_DIRECTORY_STORAGE_UID = '1.2.840.10008.1.3.10';
 
 function requiredNumber(dataSet: DataSet, tag: string, label: string): number {
   const values = [dataSet.intString(tag), dataSet.uint16(tag), dataSet.floatString(tag)];
@@ -81,14 +83,21 @@ function median(values: number[]): number {
     : sorted[middle];
 }
 
-function parseVolume(buffer: ArrayBuffer, sourceName: string): SerializedDicomVolume {
+function parseVolume(
+  buffer: ArrayBuffer,
+  sourceName: string,
+  parsedDataSet?: DataSet,
+): SerializedDicomVolume {
   const bytes = new Uint8Array(buffer);
   if (bytes.byteLength < 132 || bytes[128] !== 0x44 || bytes[129] !== 0x49 ||
       bytes[130] !== 0x43 || bytes[131] !== 0x4d) {
     throw new Error('Файл не содержит сигнатуру DICM в позиции 128 и не распознан как Part 10 DICOM.');
   }
 
-  const dataSet = parseDicom(bytes);
+  const dataSet = parsedDataSet ?? parseDicom(bytes);
+  if (dataSet.string(MEDIA_STORAGE_SOP_CLASS_TAG)?.trim() === DICOM_DIRECTORY_STORAGE_UID) {
+    throw new Error('DICOMDIR — это служебный индекс папки, а не изображение. Выберите папку целиком, включая вложенную папку IMAGES.');
+  }
   const transferSyntax = dataSet.string('x00020010')?.trim();
   const littleEndian = transferSyntax !== '1.2.840.10008.1.2.2';
   if (!transferSyntax || !littleEndian || ![
@@ -357,9 +366,147 @@ function parseVolume(buffer: ArrayBuffer, sourceName: string): SerializedDicomVo
   };
 }
 
-workerScope.onmessage = (event: MessageEvent<{ buffer: ArrayBuffer; sourceName: string }>) => {
+function scalarArray(volume: SerializedDicomVolume): Uint8Array | Uint16Array | Int16Array | Float32Array {
+  switch (volume.scalarType) {
+    case 'Uint8Array':
+      return new Uint8Array(volume.scalarData);
+    case 'Uint16Array':
+      return new Uint16Array(volume.scalarData);
+    case 'Int16Array':
+      return new Int16Array(volume.scalarData);
+    case 'Float32Array':
+      return new Float32Array(volume.scalarData);
+  }
+}
+
+function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): SerializedDicomVolume {
+  if (volumes.some((volume) => volume.numberOfFrames !== 1)) {
+    throw new Error('Для папки выберите либо один multi-frame DICOM, либо серию отдельных одно-кадровых срезов.');
+  }
+
+  const first = volumes[0];
+  const requiredMetadata = [
+    'SeriesInstanceUID',
+    'FrameOfReferenceUID',
+    'Rows',
+    'Columns',
+    'BitsAllocated',
+    'BitsStored',
+    'SamplesPerPixel',
+    'HighBit',
+    'PhotometricInterpretation',
+    'PixelRepresentation',
+    'Modality',
+    'PixelSpacing',
+    'ImageOrientationPatient',
+  ] as const;
+  for (const volume of volumes.slice(1)) {
+    for (const key of requiredMetadata) {
+      const firstValue = first.metadata[key];
+      const nextValue = volume.metadata[key];
+      if (Array.isArray(firstValue) && Array.isArray(nextValue)) {
+        if (firstValue.length !== nextValue.length ||
+            firstValue.some((value, index) =>
+              typeof value !== 'number' || typeof nextValue[index] !== 'number' ||
+              Math.abs(value - nextValue[index]!) > 0.0001)) {
+          throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+        }
+      } else if (firstValue !== nextValue) {
+        throw new Error('В папке найдены разные DICOM-серии. Перетащите папку только с одной серией срезов.');
+      }
+    }
+    if (volume.dimensions[0] !== first.dimensions[0] ||
+        volume.dimensions[1] !== first.dimensions[1]) {
+      throw new Error('Размеры изображений в серии различаются; построить единый MPR-объем нельзя.');
+    }
+  }
+  if (!first.metadata.SeriesInstanceUID) {
+    throw new Error('В DICOM отсутствует Series Instance UID; безопасно объединить срезы нельзя.');
+  }
+
+  const normal = [first.direction[6], first.direction[7], first.direction[8]];
+  const sorted = volumes.map((volume) => ({
+    volume,
+    projection: volume.origin[0] * normal[0] +
+      volume.origin[1] * normal[1] +
+      volume.origin[2] * normal[2],
+  })).sort((a, b) => a.projection - b.projection);
+
+  const distances = sorted.slice(1).map((item, index) =>
+    item.projection - sorted[index].projection);
+  if (distances.some((distance) => distance <= 0.001)) {
+    throw new Error('В серии есть срезы с совпадающими позициями; корректный MPR-объем построить нельзя.');
+  }
+  const spacingZ = distances.length > 0 ? median(distances) : first.spacing[2];
+  if (!Number.isFinite(spacingZ) || spacingZ <= 0) {
+    throw new Error('Не удалось определить положительный шаг между срезами серии.');
+  }
+  if (distances.some((distance) =>
+    Math.abs(distance - spacingZ) > Math.max(0.02, spacingZ * 0.02))) {
+    throw new Error('Позиции срезов имеют неравномерный шаг; построение регулярного MPR-объема небезопасно.');
+  }
+
+  const scalarTypes = new Set(sorted.map(({ volume }) => volume.scalarType));
+  const scalarType = scalarTypes.size === 1
+    ? first.scalarType
+    : 'Float32Array';
+  const voxelCountPerSlice = first.dimensions[0] * first.dimensions[1];
+  const voxelCount = voxelCountPerSlice * sorted.length;
+  const scalarData = scalarType === 'Float32Array'
+    ? new Float32Array(voxelCount)
+    : scalarType === 'Uint8Array'
+      ? new Uint8Array(voxelCount)
+      : scalarType === 'Int16Array'
+        ? new Int16Array(voxelCount)
+        : new Uint16Array(voxelCount);
+  sorted.forEach(({ volume }, index) => {
+    scalarData.set(
+      scalarArray(volume),
+      index * voxelCountPerSlice,
+    );
+  });
+
+  return {
+    ...first,
+    scalarData: scalarData.buffer,
+    scalarType,
+    dimensions: [first.dimensions[0], first.dimensions[1], sorted.length],
+    spacing: [first.spacing[0], first.spacing[1], spacingZ],
+    origin: sorted[0].volume.origin,
+    numberOfFrames: sorted.length,
+    sliceThickness: first.sliceThickness,
+    sourceName,
+  };
+}
+
+function parseFiles(buffers: ArrayBuffer[], sourceName: string): SerializedDicomVolume {
+  if (buffers.length === 0) {
+    throw new Error('Не найдены DICOM-файлы для загрузки.');
+  }
+  if (buffers.length === 1) return parseVolume(buffers[0], sourceName);
+  const volumes: SerializedDicomVolume[] = [];
+  for (const buffer of buffers) {
+    const dataSet = parseDicom(new Uint8Array(buffer));
+    if (dataSet.string(MEDIA_STORAGE_SOP_CLASS_TAG)?.trim() === DICOM_DIRECTORY_STORAGE_UID) {
+      continue;
+    }
+    volumes.push(parseVolume(buffer, `срез ${volumes.length + 1}`, dataSet));
+  }
+  if (volumes.length === 0) {
+    throw new Error('В папке найден только DICOMDIR, но нет файлов изображений. Выберите папку целиком, включая вложенную папку IMAGES.');
+  }
+  if (volumes.length === 1) {
+    return {
+      ...volumes[0],
+      sourceName: `DICOM том (${volumes[0].numberOfFrames} кадров)`,
+    };
+  }
+  return combineSlices(volumes, `DICOM серия (${volumes.length} срезов)`);
+}
+
+workerScope.onmessage = (event: MessageEvent<{ buffers: ArrayBuffer[]; sourceName: string }>) => {
   try {
-    const result = parseVolume(event.data.buffer, event.data.sourceName);
+    const result = parseFiles(event.data.buffers, event.data.sourceName);
     workerScope.postMessage(result, [result.scalarData]);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Не удалось обработать DICOM-файл.';

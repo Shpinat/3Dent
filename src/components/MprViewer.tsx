@@ -156,10 +156,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
           bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Auxiliary }],
         });
         toolGroup.setToolActive(cornerstoneTools.ZoomTool.toolName, {
-          bindings: [{
-            mouseButton: cornerstoneTools.Enums.MouseBindings.Primary,
-            modifierKey: cornerstoneTools.Enums.KeyboardBindings.Shift,
-          }],
+          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Wheel }],
         });
 
         renderingEngine.render();
@@ -180,11 +177,11 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
     return () => {
       disposed = true;
       resizeObserver?.disconnect();
-
+      
       if (localImageMetadataProvider) {
         cornerstone.metaData.removeProvider(localImageMetadataProvider);
       }
-
+      
       if (toolGroupId) {
         const toolGroup = cornerstoneTools.ToolGroupManager.getToolGroup(toolGroupId);
         if (toolGroup) {
@@ -192,15 +189,15 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
         }
         cornerstoneTools.ToolGroupManager.destroyToolGroup(toolGroupId);
       }
-
+      
       if (renderingEngine) {
         renderingEngine.destroy();
       }
-
+      
       if (volumeId && cornerstone.cache.getVolume(volumeId)) {
         cornerstone.cache.removeVolumeLoadObject(volumeId);
       }
-
+      
       // Critical for 180MB files: completely purge cache and WebGL textures
       cornerstone.cache.purgeCache();
     };
@@ -229,7 +226,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
         <span><kbd>ЛКМ</kbd> перекрестие</span>
         <span><kbd>ПКМ</kbd> окно/уровень</span>
         <span><kbd>Средняя кнопка</kbd> панорамирование</span>
-        <span><kbd>Shift</kbd> + <kbd>ЛКМ</kbd> масштаб</span>
+        <span><kbd>Колесико</kbd> масштаб</span>
       </div>
     </section>
   );
