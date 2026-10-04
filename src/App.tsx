@@ -135,8 +135,22 @@ export default function App() {
     }
   };
 
+  const handleDragOver = (event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setDragging(true);
+  };
+
+  const handleDragLeave = (event: React.DragEvent<HTMLElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
+  };
+
   return (
-    <main className="app-shell">
+    <main
+      className={`app-shell${dragging ? ' app-shell--dragging' : ''}`}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <header className="app-header">
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
@@ -177,8 +191,14 @@ export default function App() {
                   onClick={() => setActiveStudyId(study.id)}
                 >
                   <div className="study-item-info">
-                    <strong>{study.volume.sourceName}</strong>
-                    <span>{study.volume.modality} · {study.volume.dimensions[0]}×{study.volume.dimensions[1]}×{study.volume.numberOfFrames}</span>
+                    <strong>{study.volume.patientName || 'Неизвестный пациент'}</strong>
+                    <span>
+                      {study.volume.studyDate && `${study.volume.studyDate} · `}
+                      {study.volume.modality}
+                    </span>
+                    <span className="study-item-desc" title={study.volume.studyDescription || study.volume.seriesDescription || study.volume.sourceName}>
+                      {study.volume.studyDescription || study.volume.seriesDescription || study.volume.sourceName}
+                    </span>
                   </div>
                   <button
                     className="study-item-remove"
@@ -196,17 +216,7 @@ export default function App() {
           </aside>
         )}
 
-        <section
-          className={`workspace${dragging ? ' workspace--dragging' : ''}`}
-        onDragOver={(event) => {
-          event.preventDefault();
-          setDragging(true);
-        }}
-        onDragLeave={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
-        }}
-          onDrop={handleDrop}
-        >
+        <section className="workspace">
           {activeVolume ? (
             <>
               <div className="study-bar">

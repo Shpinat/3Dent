@@ -32,6 +32,21 @@ button {
   background:
     radial-gradient(ellipse at 50% -30%, rgba(60, 109, 123, 0.13), transparent 55%),
     #0a0e14;
+  transition: background 180ms ease;
+}
+
+.app-shell--dragging {
+  background: rgba(97, 216, 187, 0.045);
+}
+
+.app-shell--dragging::after {
+  content: '';
+  position: fixed;
+  inset: 12px;
+  border: 2px dashed rgba(97, 216, 187, 0.5);
+  border-radius: 12px;
+  pointer-events: none;
+  z-index: 100;
 }
 
 .app-header {
@@ -127,7 +142,6 @@ button {
   flex: 1;
   flex-direction: column;
   padding: 24px 28px 28px;
-  transition: background 180ms ease;
   overflow-y: auto;
 }
 
@@ -204,6 +218,14 @@ button {
   color: #7f8d9c;
 }
 
+.study-item-info .study-item-desc {
+  font-size: 11px;
+  color: #a4b1bd;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .study-item-remove {
   background: transparent;
   border: none;
@@ -218,11 +240,6 @@ button {
   color: #f08177;
 }
 
-.workspace--dragging {
-  background: rgba(97, 216, 187, 0.045);
-  outline: 1px dashed rgba(97, 216, 187, 0.5);
-  outline-offset: -12px;
-}
 
 .empty-state {
   width: min(480px, 100%);
