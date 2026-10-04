@@ -331,7 +331,7 @@ button {
 }
 
 .primary-button:hover {
-  background: #82e8cf;
+  background: #89d6ff;
   transform: translateY(-1px);
 }
 
@@ -619,7 +619,7 @@ kbd {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #42b99c, #8be8ce);
+  background: linear-gradient(90deg, #289ce0, #89d6ff);
   transition: width 180ms ease;
 }
 
