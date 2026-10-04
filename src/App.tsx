@@ -122,10 +122,8 @@ export default function App() {
       }
 
       if (files.length > 1) {
-        dicomFiles = [];
-        for (const file of files) {
-          if (await hasDicomSignature(file)) dicomFiles.push(file);
-        }
+        const signatureChecks = await Promise.all(files.map(file => hasDicomSignature(file)));
+        dicomFiles = files.filter((_, index) => signatureChecks[index]);
         if (dicomFiles.length === 0) {
           throw new Error('В выбранной папке не найдены файлы DICOM с сигнатурой DICM.');
         }
