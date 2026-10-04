@@ -10,6 +10,85 @@ const VIEWPORTS = [
   { id: 'coronal', label: 'Coronal', orientation: cornerstone.Enums.OrientationAxis.CORONAL },
 ] as const;
 
+function isPoint3(point: unknown): point is cornerstone.Types.Point3 {
+  return Array.isArray(point) && point.length === 3 &&
+    point.every((coordinate) => typeof coordinate === 'number');
+}
+
+class CursorCrosshairsTool extends cornerstoneTools.CrosshairsTool {
+  constructor(...args: ConstructorParameters<typeof cornerstoneTools.CrosshairsTool>) {
+    super(...args);
+
+    const mouseMoveCallback = this.mouseMoveCallback;
+    this.mouseMoveCallback = (...eventArgs) => {
+      const [event, annotations] = eventArgs;
+      const viewport = cornerstone.getEnabledElement(event.detail.element)?.viewport;
+      const pointer = event.detail.currentPoints.canvas;
+      const overRotationHandle = viewport && annotations?.some((annotation) => {
+        const rotationPoints = annotation.data.handles?.['rotationPoints'];
+        return Array.isArray(rotationPoints) && rotationPoints.some((handle: unknown) => {
+          if (!Array.isArray(handle) || !isPoint3(handle[0])) return false;
+          const point = viewport.worldToCanvas(handle[0]);
+          return Math.hypot(point[0] - pointer[0], point[1] - pointer[1]) <= 8;
+        });
+      });
+      const needsRender = mouseMoveCallback(...eventArgs);
+      event.detail.element.style.cursor = overRotationHandle ? 'grab' : '';
+      return needsRender;
+    };
+
+    const handleSelectedCallback = this.handleSelectedCallback;
+    this.handleSelectedCallback = (...eventArgs) => {
+      handleSelectedCallback(...eventArgs);
+      if (eventArgs[1].data.handles?.['activeOperation'] === 2) {
+        eventArgs[0].detail.element.style.cursor = 'grabbing';
+      }
+    };
+
+    const toolSelectedCallback = this.toolSelectedCallback;
+    this.toolSelectedCallback = (...eventArgs) => {
+      toolSelectedCallback(...eventArgs);
+      if (eventArgs[1].data.handles?.['activeOperation'] === 2) {
+        eventArgs[0].detail.element.style.cursor = 'grabbing';
+      }
+    };
+
+    const endCallback = this._endCallback;
+    this._endCallback = (...eventArgs) => {
+      endCallback(...eventArgs);
+      eventArgs[0].detail.element.style.cursor = '';
+    };
+  }
+}
+
+function createSynchronizedWindowLevelTool(
+  viewports: cornerstone.VolumeViewport[],
+  toolName: string,
+) {
+  return class SynchronizedWindowLevelTool extends cornerstoneTools.WindowLevelTool {
+    static toolName = toolName;
+
+    constructor(...args: ConstructorParameters<typeof cornerstoneTools.WindowLevelTool>) {
+      super(...args);
+
+      const mouseDragCallback = this.mouseDragCallback.bind(this);
+      this.mouseDragCallback = (event) => {
+        mouseDragCallback(event);
+        const sourceViewport = cornerstone.getEnabledElement(event.detail.element)?.viewport;
+        if (!(sourceViewport instanceof cornerstone.VolumeViewport)) return;
+
+        const { voiRange, VOILUTFunction } = sourceViewport.getProperties() ?? {};
+        if (!voiRange) return;
+        for (const viewport of viewports) {
+          if (viewport === sourceViewport) continue;
+          viewport.setProperties({ voiRange, VOILUTFunction }, undefined, true);
+          viewport.render();
+        }
+      };
+    }
+  };
+}
+
 interface MprViewerProps {
   volume: ParsedDicomVolume;
   onStatus: (message: string, progress: number) => void;
@@ -135,21 +214,25 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
           });
         }
 
-        cornerstoneTools.addTool(cornerstoneTools.CrosshairsTool);
-        cornerstoneTools.addTool(cornerstoneTools.WindowLevelTool);
+        const SynchronizedWindowLevelTool = createSynchronizedWindowLevelTool(
+          viewports,
+          `WindowLevel-${suffix}`,
+        );
+        cornerstoneTools.addTool(CursorCrosshairsTool);
+        cornerstoneTools.addTool(SynchronizedWindowLevelTool);
         cornerstoneTools.addTool(cornerstoneTools.PanTool);
         cornerstoneTools.addTool(cornerstoneTools.ZoomTool);
         const toolGroup = cornerstoneTools.ToolGroupManager.createToolGroup(toolGroupId);
         if (!toolGroup) throw new Error('Не удалось создать группу инструментов Cornerstone.');
         for (const { id } of VIEWPORTS) toolGroup.addViewport(id, renderingEngineId);
-        toolGroup.addTool(cornerstoneTools.CrosshairsTool.toolName);
-        toolGroup.addTool(cornerstoneTools.WindowLevelTool.toolName);
+        toolGroup.addTool(CursorCrosshairsTool.toolName);
+        toolGroup.addTool(SynchronizedWindowLevelTool.toolName);
         toolGroup.addTool(cornerstoneTools.PanTool.toolName);
         toolGroup.addTool(cornerstoneTools.ZoomTool.toolName);
-        toolGroup.setToolActive(cornerstoneTools.CrosshairsTool.toolName, {
+        toolGroup.setToolActive(CursorCrosshairsTool.toolName, {
           bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Primary }],
         });
-        toolGroup.setToolActive(cornerstoneTools.WindowLevelTool.toolName, {
+        toolGroup.setToolActive(SynchronizedWindowLevelTool.toolName, {
           bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Secondary }],
         });
         toolGroup.setToolActive(cornerstoneTools.PanTool.toolName, {
@@ -224,7 +307,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
       ))}
       <div className="interaction-hint">
         <span><kbd>ЛКМ</kbd> перекрестие</span>
-        <span><kbd>ПКМ</kbd> окно/уровень</span>
+        <span><kbd>ПКМ</kbd> окно/уровень во всех окнах</span>
         <span><kbd>Средняя кнопка</kbd> панорамирование</span>
         <span><kbd>Колесико</kbd> масштаб</span>
       </div>
