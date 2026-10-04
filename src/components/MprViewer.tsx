@@ -30,14 +30,15 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
       | undefined;
     let resizeObserver: ResizeObserver | undefined;
 
+    const suffix = crypto.randomUUID();
+    const renderingEngineId = `mpr-engine-${suffix}`;
+
     const setup = async () => {
       try {
         onStatus('Инициализация WebGL и MPR…', 93);
         await initializeCornerstone();
         if (disposed) return;
 
-        const suffix = crypto.randomUUID();
-        const renderingEngineId = `mpr-engine-${suffix}`;
         toolGroupId = `mpr-tools-${suffix}`;
         volumeId = `local:dicom-volume-${suffix}`;
         renderingEngine = new cornerstone.RenderingEngine(renderingEngineId);
@@ -155,10 +156,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
           bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Auxiliary }],
         });
         toolGroup.setToolActive(cornerstoneTools.ZoomTool.toolName, {
-          bindings: [{
-            mouseButton: cornerstoneTools.Enums.MouseBindings.Primary,
-            modifierKey: cornerstoneTools.Enums.KeyboardBindings.Shift,
-          }],
+          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Wheel }],
         });
 
         renderingEngine.render();
@@ -179,14 +177,29 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
     return () => {
       disposed = true;
       resizeObserver?.disconnect();
+      
       if (localImageMetadataProvider) {
         cornerstone.metaData.removeProvider(localImageMetadataProvider);
       }
-      if (toolGroupId) cornerstoneTools.ToolGroupManager.destroyToolGroup(toolGroupId);
-      renderingEngine?.destroy();
+      
+      if (toolGroupId) {
+        const toolGroup = cornerstoneTools.ToolGroupManager.getToolGroup(toolGroupId);
+        if (toolGroup) {
+          VIEWPORTS.forEach(({ id }) => toolGroup.removeViewports(renderingEngineId, id));
+        }
+        cornerstoneTools.ToolGroupManager.destroyToolGroup(toolGroupId);
+      }
+      
+      if (renderingEngine) {
+        renderingEngine.destroy();
+      }
+      
       if (volumeId && cornerstone.cache.getVolume(volumeId)) {
         cornerstone.cache.removeVolumeLoadObject(volumeId);
       }
+      
+      // Critical for 180MB files: completely purge cache and WebGL textures
+      cornerstone.cache.purgeCache();
     };
   }, [onError, onReady, onStatus, volume]);
 
@@ -213,7 +226,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
         <span><kbd>ЛКМ</kbd> перекрестие</span>
         <span><kbd>ПКМ</kbd> окно/уровень</span>
         <span><kbd>Средняя кнопка</kbd> панорамирование</span>
-        <span><kbd>Shift</kbd> + <kbd>ЛКМ</kbd> масштаб</span>
+        <span><kbd>Колесико</kbd> масштаб</span>
       </div>
     </section>
   );

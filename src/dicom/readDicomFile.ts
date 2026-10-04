@@ -10,43 +10,40 @@ export function readDicomFile(
   file: File,
   onProgress: (progress: ReadProgress) => void,
 ): Promise<ParsedDicomVolume> {
+  return readDicomFiles([file], onProgress);
+}
+
+export function readDicomFiles(
+  files: File[],
+  onProgress: (progress: ReadProgress) => void,
+): Promise<ParsedDicomVolume> {
+  if (files.length === 0) {
+    return Promise.reject(new Error('Не выбраны файлы DICOM для загрузки.'));
+  }
+
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
     const worker = new Worker(new URL('./dicomParser.worker.ts', import.meta.url), {
       type: 'module',
     });
+    const buffers: ArrayBuffer[] = [];
+    const totalSize = files.reduce((total, file) => total + file.size, 0);
+    let completedSize = 0;
+    let currentReader: FileReader | undefined;
+    let settled = false;
 
     const cleanUp = () => {
+      settled = true;
+      currentReader?.abort();
       worker.terminate();
-      reader.onload = null;
-      reader.onerror = null;
-      reader.onprogress = null;
     };
 
-    reader.onprogress = (event) => {
-      if (event.lengthComputable) {
-        onProgress({ loaded: event.loaded, total: event.total, stage: 'reading' });
-      }
-    };
-    reader.onerror = () => {
-      cleanUp();
-      reject(reader.error ?? new Error('Не удалось прочитать локальный файл.'));
-    };
-    reader.onload = () => {
-      if (!(reader.result instanceof ArrayBuffer)) {
-        cleanUp();
-        reject(new Error('FileReader не вернул ArrayBuffer.'));
-        return;
-      }
-      onProgress({ loaded: file.size, total: file.size, stage: 'parsing' });
-      worker.postMessage({ buffer: reader.result, sourceName: file.name }, [reader.result]);
-    };
-
-    worker.onerror = (event) => {
+    worker.onerror = (event: ErrorEvent) => {
+      if (settled) return;
       cleanUp();
       reject(new Error(`Ошибка DICOM Worker: ${event.message || 'не удалось обработать файл.'}`));
     };
     worker.onmessage = (event: MessageEvent<SerializedDicomVolume | { error: string }>) => {
+      if (settled) return;
       cleanUp();
       if ('error' in event.data) {
         reject(new Error(event.data.error));
@@ -58,7 +55,57 @@ export function readDicomFile(
       });
     };
 
-    reader.readAsArrayBuffer(file);
+    const readNextFile = (index: number) => {
+      if (settled) return;
+      if (index === files.length) {
+        onProgress({ loaded: totalSize, total: totalSize, stage: 'parsing' });
+        worker.postMessage(
+          {
+            buffers,
+            sourceName: files.length === 1 ? files[0].name : `DICOM серия (${files.length} срезов)`,
+          },
+          buffers,
+        );
+        return;
+      }
+
+      currentReader = new FileReader();
+      currentReader.onprogress = (event) => {
+        if (event.lengthComputable) {
+          onProgress({
+            loaded: completedSize + event.loaded,
+            total: totalSize,
+            stage: 'reading',
+          });
+        }
+      };
+      currentReader.onerror = () => {
+        if (settled) return;
+        const error = currentReader?.error;
+        cleanUp();
+        reject(error ?? new Error(`Не удалось прочитать локальный файл «${files[index].name}».`));
+      };
+      currentReader.onabort = () => {
+        if (settled) return;
+        cleanUp();
+        reject(new Error(`Чтение локального файла «${files[index].name}» было прервано.`));
+      };
+      currentReader.onload = () => {
+        if (settled) return;
+        if (!(currentReader?.result instanceof ArrayBuffer)) {
+          cleanUp();
+          reject(new Error(`FileReader не вернул ArrayBuffer для файла «${files[index].name}».`));
+          return;
+        }
+        buffers.push(currentReader.result);
+        completedSize += files[index].size;
+        onProgress({ loaded: completedSize, total: totalSize, stage: 'reading' });
+        readNextFile(index + 1);
+      };
+      currentReader.readAsArrayBuffer(files[index]);
+    };
+
+    readNextFile(0);
   });
 }
 

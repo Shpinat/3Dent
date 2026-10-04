@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useRef, useState } from 'react';
-import { readDicomFile, type ReadProgress } from './dicom/readDicomFile';
+import { readDicomFiles, type ReadProgress } from './dicom/readDicomFile';
 import type { ParsedDicomVolume } from './dicom/types';
 
 const MprViewer = lazy(() =>
@@ -11,8 +11,50 @@ interface LoadingState {
   progress: number;
 }
 
+async function getFilesFromEntry(entry: FileSystemEntry): Promise<File[]> {
+  if (entry.isFile) {
+    return new Promise((resolve, reject) => {
+      (entry as FileSystemFileEntry).file((file) => resolve([file]), reject);
+    });
+  }
+  if (!entry.isDirectory) return [];
+
+  const reader = (entry as FileSystemDirectoryEntry).createReader();
+  const children: FileSystemEntry[] = [];
+  while (true) {
+    const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => {
+      reader.readEntries(resolve, reject);
+    });
+    if (batch.length === 0) break;
+    children.push(...batch);
+  }
+  const files = await Promise.all(children.map(getFilesFromEntry));
+  return files.flat();
+}
+
+async function getDroppedFiles(dataTransfer: DataTransfer): Promise<File[]> {
+  const entries = Array.from(dataTransfer.items)
+    .map((item) => (item as DataTransferItem & {
+      webkitGetAsEntry?: () => FileSystemEntry | null;
+    }).webkitGetAsEntry?.())
+    .filter((entry): entry is FileSystemEntry => entry !== null && entry !== undefined);
+  if (entries.length === 0) return Array.from(dataTransfer.files);
+  const files = await Promise.all(entries.map(getFilesFromEntry));
+  return files.flat();
+}
+
+async function hasDicomSignature(file: File): Promise<boolean> {
+  const signature = new Uint8Array(await file.slice(128, 132).arrayBuffer());
+  return signature.length === 4 &&
+    signature[0] === 0x44 &&
+    signature[1] === 0x49 &&
+    signature[2] === 0x43 &&
+    signature[3] === 0x4d;
+}
+
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const [volume, setVolume] = useState<ParsedDicomVolume | null>(null);
   const [loading, setLoading] = useState<LoadingState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -29,13 +71,27 @@ export default function App() {
     setLoading({ message: 'Чтение файла с диска…', progress: percentage });
   }, []);
 
-  const loadFile = useCallback(async (file?: File) => {
-    if (!file) return;
+  const loadFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) {
+      setError('Папка не содержит файлов для загрузки.');
+      setLoading(null);
+      return;
+    }
     setVolume(null);
     setError(null);
     setLoading({ message: 'Подготовка чтения…', progress: 0 });
     try {
-      const parsedVolume = await readDicomFile(file, handleProgress);
+      let dicomFiles = files;
+      if (files.length > 1) {
+        dicomFiles = [];
+        for (const file of files) {
+          if (await hasDicomSignature(file)) dicomFiles.push(file);
+        }
+        if (dicomFiles.length === 0) {
+          throw new Error('В выбранной папке не найдены файлы DICOM с сигнатурой DICM.');
+        }
+      }
+      const parsedVolume = await readDicomFiles(dicomFiles, handleProgress);
       setVolume(parsedVolume);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Не удалось загрузить файл.');
@@ -53,10 +109,16 @@ export default function App() {
     setVolume(null);
   }, []);
 
-  const handleDrop = (event: React.DragEvent<HTMLElement>) => {
+  const handleDrop = async (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
     setDragging(false);
-    void loadFile(event.dataTransfer.files[0]);
+    setLoading({ message: 'Чтение содержимого папки…', progress: 0 });
+    try {
+      await loadFiles(await getDroppedFiles(event.dataTransfer));
+    } catch (dropError) {
+      setError(dropError instanceof Error ? dropError.message : 'Не удалось прочитать папку.');
+      setLoading(null);
+    }
   };
 
   return (
@@ -108,6 +170,9 @@ export default function App() {
               <button className="change-file-button" onClick={() => inputRef.current?.click()}>
                 Открыть файл
               </button>
+              <button className="change-file-button" onClick={() => folderInputRef.current?.click()}>
+                Открыть папку
+              </button>
             </div>
             <Suspense fallback={null}>
               <MprViewer
@@ -129,12 +194,15 @@ export default function App() {
               <div className="scan-center" />
             </div>
             <p className="eyebrow">ЛОКАЛЬНЫЙ ПРОСМОТР КЛКТ</p>
-            <h2>{dragging ? 'Отпустите файл для загрузки' : 'Откройте DICOM-том'}</h2>
+            <h2>{dragging ? 'Отпустите файл или папку' : 'Откройте DICOM-том'}</h2>
             <p className="empty-copy">
-              Один multi-frame файл — все срезы исследования. Имя и расширение файла не имеют значения.
+              Перетащите multi-frame файл или папку с отдельными срезами. Имя и расширение не имеют значения.
             </p>
             <button className="primary-button" onClick={() => inputRef.current?.click()}>
               <span aria-hidden="true">＋</span> Выбрать файл
+            </button>
+            <button className="folder-button" onClick={() => folderInputRef.current?.click()}>
+              Выбрать папку
             </button>
             <p className="privacy-note">
               <span aria-hidden="true">◈</span> Файл обрабатывается только в браузере и не отправляется на сервер
@@ -153,7 +221,21 @@ export default function App() {
         className="file-input"
         type="file"
         onChange={(event) => {
-          void loadFile(event.currentTarget.files?.[0]);
+          void loadFiles(Array.from(event.currentTarget.files ?? []));
+          event.currentTarget.value = '';
+        }}
+      />
+      <input
+        ref={(input) => {
+          folderInputRef.current = input;
+          input?.setAttribute('webkitdirectory', '');
+          input?.setAttribute('directory', '');
+        }}
+        className="file-input"
+        type="file"
+        multiple
+        onChange={(event) => {
+          void loadFiles(Array.from(event.currentTarget.files ?? []));
           event.currentTarget.value = '';
         }}
       />

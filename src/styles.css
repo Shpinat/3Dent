@@ -224,6 +224,27 @@ button {
   transform: translateY(-1px);
 }
 
+.folder-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 23px 0 0 8px;
+  padding: 11px 18px;
+  border: 1px solid #34414d;
+  border-radius: 7px;
+  color: #c5d0d9;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease;
+}
+
+.folder-button:hover {
+  border-color: #5db59f;
+  color: #a1ead5;
+}
+
 .primary-button span {
   font-size: 16px;
   line-height: 12px;
@@ -321,6 +342,10 @@ button {
   background: transparent;
   font-size: 10px;
   cursor: pointer;
+}
+
+.change-file-button + .change-file-button {
+  margin-left: -12px;
 }
 
 .change-file-button:hover {
