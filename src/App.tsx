@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useRef, useState } from 'react';
 import { readDicomFiles, type ReadProgress } from './dicom/readDicomFile';
-import type { ParsedDicomVolume } from './dicom/types';
+import type { ParsedDicomVolume, VolumeSavedState } from './dicom/types';
 
 const MprViewer = lazy(() =>
   import('./components/MprViewer').then((module) => ({ default: module.MprViewer })),
@@ -67,13 +67,14 @@ async function hasDicomSignature(file: File): Promise<boolean> {
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const [studies, setStudies] = useState<{ id: string, volume: ParsedDicomVolume }[]>([]);
+  const [studies, setStudies] = useState<{ id: string, volume: ParsedDicomVolume, savedState?: VolumeSavedState }[]>([]);
   const [activeStudyId, setActiveStudyId] = useState<string | null>(null);
   const [loading, setLoading] = useState<LoadingState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
 
-  const activeVolume = studies.find(s => s.id === activeStudyId)?.volume || null;
+  const activeStudy = studies.find(s => s.id === activeStudyId);
+  const activeVolume = activeStudy?.volume || null;
 
   const handleProgress = useCallback((progress: ReadProgress) => {
     if (progress.stage === 'parsing') {
@@ -148,6 +149,13 @@ export default function App() {
     setLoading(null);
     if (activeStudyId) removeStudy(activeStudyId);
   }, [activeStudyId, removeStudy]);
+
+  const handleSaveState = useCallback((state: VolumeSavedState) => {
+    if (!activeStudyId) return;
+    setStudies(prev => prev.map(study =>
+      study.id === activeStudyId ? { ...study, savedState: state } : study
+    ));
+  }, [activeStudyId]);
 
   const handleDrop = async (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
@@ -263,6 +271,8 @@ export default function App() {
               <Suspense fallback={null}>
                 <MprViewer
                   volume={activeVolume}
+                  savedState={activeStudy?.savedState}
+                  onSaveState={handleSaveState}
                   onStatus={handleViewerStatus}
                   onReady={handleReady}
                   onError={handleViewerError}

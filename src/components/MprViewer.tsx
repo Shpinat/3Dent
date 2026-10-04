@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as cornerstone from '@cornerstonejs/core';
 import * as cornerstoneTools from '@cornerstonejs/tools';
-import type { ParsedDicomVolume } from '../dicom/types';
+import type { ParsedDicomVolume, VolumeSavedState } from '../dicom/types';
 import { initializeCornerstone } from '../cornerstone';
 
 const VIEWPORTS = [
@@ -91,12 +91,14 @@ function createSynchronizedWindowLevelTool(
 
 interface MprViewerProps {
   volume: ParsedDicomVolume;
+  savedState?: VolumeSavedState;
+  onSaveState?: (state: VolumeSavedState) => void;
   onStatus: (message: string, progress: number) => void;
   onReady: () => void;
   onError: (message: string) => void;
 }
 
-export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps) {
+export function MprViewer({ volume, savedState, onSaveState, onStatus, onReady, onError }: MprViewerProps) {
   const elementRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   useEffect(() => {
@@ -243,6 +245,27 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
         });
 
         renderingEngine.render();
+
+        if (savedState) {
+          VIEWPORTS.forEach(({ id }) => {
+            const viewport = renderingEngine?.getViewport(id);
+            const viewportState = savedState.viewports[id];
+            if (viewport && viewport instanceof cornerstone.VolumeViewport && viewportState) {
+              if (viewportState.camera) {
+                viewport.setCamera(viewportState.camera);
+              }
+              if (viewportState.voi) {
+                const voiRange = {
+                  lower: viewportState.voi.windowCenter - viewportState.voi.windowWidth / 2,
+                  upper: viewportState.voi.windowCenter + viewportState.voi.windowWidth / 2,
+                };
+                viewport.setProperties({ voiRange });
+              }
+            }
+          });
+          renderingEngine.render();
+        }
+
         resizeObserver = new ResizeObserver(() => renderingEngine?.resize(true, true));
         for (const { id } of VIEWPORTS) {
           const element = elementRefs.current[id];
@@ -261,6 +284,25 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
       disposed = true;
       resizeObserver?.disconnect();
       
+      if (renderingEngine && onSaveState) {
+        const stateToSave: VolumeSavedState = { viewports: {} };
+        VIEWPORTS.forEach(({ id }) => {
+          const viewport = renderingEngine?.getViewport(id);
+          if (viewport && viewport instanceof cornerstone.VolumeViewport) {
+            const camera = viewport.getCamera();
+            const properties = viewport.getProperties();
+            stateToSave.viewports[id] = {
+              camera,
+              voi: properties?.voiRange ? {
+                windowWidth: properties.voiRange.upper - properties.voiRange.lower,
+                windowCenter: (properties.voiRange.upper + properties.voiRange.lower) / 2,
+              } : undefined,
+            };
+          }
+        });
+        onSaveState(stateToSave);
+      }
+
       if (localImageMetadataProvider) {
         cornerstone.metaData.removeProvider(localImageMetadataProvider);
       }
