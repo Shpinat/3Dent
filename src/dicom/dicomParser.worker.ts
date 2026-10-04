@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-import { parseDicom, readEncapsulatedImageFrame, type DataSet, type Element } from 'dicom-parser';
+import { parseDicom, type DataSet, type Element } from 'dicom-parser';
 import type { SerializedDicomVolume } from './types';
 
 const workerScope: DedicatedWorkerGlobalScope = self as DedicatedWorkerGlobalScope;
@@ -161,11 +161,11 @@ function decodeString(dataSet: DataSet, tag: string): string | undefined {
   return cleaned;
 }
 
-async function parseVolume(
+function parseVolume(
   buffer: ArrayBuffer,
   sourceName: string,
   parsedDataSet?: DataSet,
-): Promise<SerializedDicomVolume> {
+): SerializedDicomVolume {
   const bytes = new Uint8Array(buffer);
   if (bytes.byteLength < 132 || bytes[128] !== 0x44 || bytes[129] !== 0x49 ||
       bytes[130] !== 0x43 || bytes[131] !== 0x4d) {
@@ -178,12 +178,11 @@ async function parseVolume(
   }
   const transferSyntax = dataSet.string('x00020010')?.trim();
   const littleEndian = transferSyntax !== '1.2.840.10008.1.2.2';
-  const isJpegBaseline = transferSyntax === '1.2.840.10008.1.2.4.50';
-  if (!transferSyntax || !littleEndian || (![
+  if (!transferSyntax || !littleEndian || ![
     '1.2.840.10008.1.2',
     '1.2.840.10008.1.2.1',
-  ].includes(transferSyntax) && !isJpegBaseline)) {
-    throw new Error(`Transfer Syntax ${transferSyntax ?? 'неизвестен'} не поддерживается. Нужен несжатый Little Endian или JPEG Baseline.`);
+  ].includes(transferSyntax)) {
+    throw new Error(`Transfer Syntax ${transferSyntax ?? 'неизвестен'} не поддерживается. Нужен несжатый Explicit/Implicit VR Little Endian.`);
   }
 
   const rows = requiredNumber(dataSet, 'x00280010', 'Rows');
@@ -209,23 +208,18 @@ async function parseVolume(
   }
 
   const pixelElement: Element | undefined = dataSet.elements[PIXEL_DATA_TAG];
-  if (!pixelElement) {
-    throw new Error('Pixel Data отсутствует.');
-  }
-  if (pixelElement.encapsulatedPixelData && !isJpegBaseline) {
-    throw new Error('Сжатие Pixel Data не поддерживается (кроме JPEG Baseline).');
+  if (!pixelElement || pixelElement.encapsulatedPixelData) {
+    throw new Error('Pixel Data отсутствует либо сжат. Для этого тома требуется несжатый Pixel Data.');
   }
 
   const voxelCount = rows * columns * numberOfFrames;
   const bytesPerPixel = bitsAllocated / 8;
   const expectedPixelBytes = voxelCount * bytesPerPixel;
-  if (!pixelElement.encapsulatedPixelData) {
-    if (!Number.isSafeInteger(voxelCount) ||
-        (pixelElement.length !== expectedPixelBytes &&
-          !(expectedPixelBytes % 2 === 1 && pixelElement.length === expectedPixelBytes + 1)) ||
-        pixelElement.dataOffset + expectedPixelBytes > bytes.byteLength) {
-      throw new Error('Размер Pixel Data не соответствует Rows × Columns × Number of Frames.');
-    }
+  if (!Number.isSafeInteger(voxelCount) ||
+      (pixelElement.length !== expectedPixelBytes &&
+        !(expectedPixelBytes % 2 === 1 && pixelElement.length === expectedPixelBytes + 1)) ||
+      pixelElement.dataOffset + expectedPixelBytes > bytes.byteLength) {
+    throw new Error('Размер Pixel Data не соответствует Rows × Columns × Number of Frames.');
   }
 
   const shared = firstItem(dataSet, SHARED_GROUPS_TAG);
@@ -385,37 +379,6 @@ async function parseVolume(
     const sourceFrame = descriptors[outputFrame].index;
     const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel;
     const destinationOffset = outputFrame * voxelsPerFrame;
-    if (pixelElement.encapsulatedPixelData && isJpegBaseline) {
-      const jpegBytes = readEncapsulatedImageFrame(dataSet, pixelElement, sourceFrame);
-      const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-      const bitmap = await createImageBitmap(blob);
-      const canvas = new OffscreenCanvas(columns, rows);
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('Не удалось создать OffscreenCanvas 2D контекст.');
-      ctx.drawImage(bitmap, 0, 0);
-      const imageData = ctx.getImageData(0, 0, columns, rows);
-      bitmap.close();
-
-      for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
-        const raw = imageData.data[voxel * 4];
-        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
-        scalarData[destinationOffset + voxel] = requiresRescale
-          ? value * slope + intercept
-          : value;
-      }
-    } else {
-      for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
-        const raw = readPixelValue(
-          view,
-          sourceOffset + voxel * bytesPerPixel,
-          bitsAllocated,
-          littleEndian,
-        );
-        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
-        scalarData[destinationOffset + voxel] = requiresRescale
-          ? value * slope + intercept
-          : value;
-      }
     for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
       const raw = readPixelValue(
         view,
@@ -630,18 +593,18 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
   };
 }
 
-async function parseFiles(buffers: ArrayBuffer[], sourceName: string): Promise<SerializedDicomVolume> {
+function parseFiles(buffers: ArrayBuffer[], sourceName: string): SerializedDicomVolume {
   if (buffers.length === 0) {
     throw new Error('Не найдены DICOM-файлы для загрузки.');
   }
-  if (buffers.length === 1) return await parseVolume(buffers[0], sourceName);
+  if (buffers.length === 1) return parseVolume(buffers[0], sourceName);
   const volumes: SerializedDicomVolume[] = [];
   for (const buffer of buffers) {
     const dataSet = parseDicom(new Uint8Array(buffer));
     if (dataSet.string(MEDIA_STORAGE_SOP_CLASS_TAG)?.trim() === DICOM_DIRECTORY_STORAGE_UID) {
       continue;
     }
-    volumes.push(await parseVolume(buffer, `срез ${volumes.length + 1}`, dataSet));
+    volumes.push(parseVolume(buffer, `срез ${volumes.length + 1}`, dataSet));
   }
   if (volumes.length === 0) {
     throw new Error('В папке найден только DICOMDIR, но нет файлов изображений. Выберите папку целиком, включая вложенную папку IMAGES.');
@@ -655,9 +618,9 @@ async function parseFiles(buffers: ArrayBuffer[], sourceName: string): Promise<S
   return combineSlices(volumes, sourceName);
 }
 
-workerScope.onmessage = async (event: MessageEvent<{ buffers: ArrayBuffer[]; sourceName: string }>) => {
+workerScope.onmessage = (event: MessageEvent<{ buffers: ArrayBuffer[]; sourceName: string }>) => {
   try {
-    const result = await parseFiles(event.data.buffers, event.data.sourceName);
+    const result = parseFiles(event.data.buffers, event.data.sourceName);
     workerScope.postMessage(result, [result.scalarData]);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Не удалось обработать DICOM-файл.';
