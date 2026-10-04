@@ -378,6 +378,11 @@ async function parseVolume(
   const view = new DataView(buffer);
   const voxelsPerFrame = rows * columns;
 
+  const shift = highBit - bitsStored + 1;
+  const mask = 2 ** bitsStored - 1;
+  const signBit = 1 << (bitsStored - 1);
+  const signMask = 1 << bitsStored;
+
   if (isCompressed && pixelElement.encapsulatedPixelData) {
     const fragments = pixelElement.fragments?.filter(f => f.length > 0) || [];
 
@@ -429,7 +434,12 @@ async function parseVolume(
 
       for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
         const raw = framePixels[voxel];
-        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
+        const storedValue = shift > 0 ? raw >>> shift : raw;
+        const masked = storedValue & mask;
+        const value = (pixelRepresentation === 1 && (masked & signBit) !== 0)
+          ? masked - signMask
+          : masked;
+
         scalarData[destinationOffset + voxel] = requiresRescale
           ? value * slope + intercept
           : value;
@@ -448,7 +458,12 @@ async function parseVolume(
           bitsAllocated,
           littleEndian,
         );
-        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
+        const storedValue = shift > 0 ? raw >>> shift : raw;
+        const masked = storedValue & mask;
+        const value = (pixelRepresentation === 1 && (masked & signBit) !== 0)
+          ? masked - signMask
+          : masked;
+
         scalarData[destinationOffset + voxel] = requiresRescale
           ? value * slope + intercept
           : value;
