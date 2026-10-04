@@ -29,7 +29,9 @@ class CursorCrosshairsTool extends cornerstoneTools.CrosshairsTool {
         return Array.isArray(rotationPoints) && rotationPoints.some((handle: unknown) => {
           if (!Array.isArray(handle) || !isPoint3(handle[0])) return false;
           const point = viewport.worldToCanvas(handle[0]);
-          return Math.hypot(point[0] - pointer[0], point[1] - pointer[1]) <= 8;
+          const dx = point[0] - pointer[0];
+          const dy = point[1] - pointer[1];
+          return dx * dx + dy * dy <= 64;
         });
       });
       const needsRender = mouseMoveCallback(...eventArgs);
