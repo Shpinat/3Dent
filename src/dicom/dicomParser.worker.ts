@@ -565,10 +565,10 @@ function parseFiles(buffers: ArrayBuffer[], sourceName: string): SerializedDicom
   if (volumes.length === 1) {
     return {
       ...volumes[0],
-      sourceName: `DICOM том (${volumes[0].numberOfFrames} кадров)`,
+      sourceName,
     };
   }
-  return combineSlices(volumes, `DICOM серия (${volumes.length} срезов)`);
+  return combineSlices(volumes, sourceName);
 }
 
 workerScope.onmessage = (event: MessageEvent<{ buffers: ArrayBuffer[]; sourceName: string }>) => {
