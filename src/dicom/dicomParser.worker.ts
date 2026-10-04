@@ -1,6 +1,8 @@
 /// <reference lib="webworker" />
 
 import { parseDicom, type DataSet, type Element } from 'dicom-parser';
+import { decode as decodeJpegBaseline } from 'jpeg-js';
+import { Decoder as JpegLosslessDecoder } from 'jpeg-lossless-decoder-js';
 import type { SerializedDicomVolume } from './types';
 
 const workerScope: DedicatedWorkerGlobalScope = self as DedicatedWorkerGlobalScope;
@@ -134,11 +136,11 @@ function decodeString(dataSet: DataSet, tag: string): string | undefined {
   return cleaned;
 }
 
-function parseVolume(
+async function parseVolume(
   buffer: ArrayBuffer,
   sourceName: string,
   parsedDataSet?: DataSet,
-): SerializedDicomVolume {
+): Promise<SerializedDicomVolume> {
   const bytes = new Uint8Array(buffer);
   if (bytes.byteLength < 132 || bytes[128] !== 0x44 || bytes[129] !== 0x49 ||
       bytes[130] !== 0x43 || bytes[131] !== 0x4d) {
@@ -151,11 +153,18 @@ function parseVolume(
   }
   const transferSyntax = dataSet.string('x00020010')?.trim();
   const littleEndian = transferSyntax !== '1.2.840.10008.1.2.2';
+  const isBaselineJPEG = transferSyntax === '1.2.840.10008.1.2.4.50';
+  const isLosslessJPEG = transferSyntax === '1.2.840.10008.1.2.4.57' || transferSyntax === '1.2.840.10008.1.2.4.70';
+  const isCompressed = isBaselineJPEG || isLosslessJPEG;
+
   if (!transferSyntax || !littleEndian || ![
     '1.2.840.10008.1.2',
     '1.2.840.10008.1.2.1',
+    '1.2.840.10008.1.2.4.50',
+    '1.2.840.10008.1.2.4.57',
+    '1.2.840.10008.1.2.4.70'
   ].includes(transferSyntax)) {
-    throw new Error(`Transfer Syntax ${transferSyntax ?? 'неизвестен'} не поддерживается. Нужен несжатый Explicit/Implicit VR Little Endian.`);
+    throw new Error(`Transfer Syntax ${transferSyntax ?? 'неизвестен'} не поддерживается. Нужен несжатый или JPEG Baseline/Lossless.`);
   }
 
   const rows = requiredNumber(dataSet, 'x00280010', 'Rows');
@@ -181,17 +190,18 @@ function parseVolume(
   }
 
   const pixelElement: Element | undefined = dataSet.elements[PIXEL_DATA_TAG];
-  if (!pixelElement || pixelElement.encapsulatedPixelData) {
-    throw new Error('Pixel Data отсутствует либо сжат. Для этого тома требуется несжатый Pixel Data.');
+  if (!pixelElement) {
+    throw new Error('Pixel Data отсутствует.');
   }
 
   const voxelCount = rows * columns * numberOfFrames;
   const bytesPerPixel = bitsAllocated / 8;
   const expectedPixelBytes = voxelCount * bytesPerPixel;
-  if (!Number.isSafeInteger(voxelCount) ||
+
+  if (!isCompressed && (!Number.isSafeInteger(voxelCount) ||
       (pixelElement.length !== expectedPixelBytes &&
         !(expectedPixelBytes % 2 === 1 && pixelElement.length === expectedPixelBytes + 1)) ||
-      pixelElement.dataOffset + expectedPixelBytes > bytes.byteLength) {
+      pixelElement.dataOffset + expectedPixelBytes > bytes.byteLength)) {
     throw new Error('Размер Pixel Data не соответствует Rows × Columns × Number of Frames.');
   }
 
@@ -340,22 +350,82 @@ function parseVolume(
         : new Uint16Array(voxelCount);
   const view = new DataView(buffer);
   const voxelsPerFrame = rows * columns;
-  for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
-    const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
-    const sourceFrame = descriptors[outputFrame].index;
-    const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel;
-    const destinationOffset = outputFrame * voxelsPerFrame;
-    for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
-      const raw = readPixelValue(
-        view,
-        sourceOffset + voxel * bytesPerPixel,
-        bitsAllocated,
-        littleEndian,
-      );
-      const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
-      scalarData[destinationOffset + voxel] = requiresRescale
-        ? value * slope + intercept
-        : value;
+
+  if (isCompressed && pixelElement.encapsulatedPixelData) {
+    const fragments = pixelElement.fragments?.filter(f => f.length > 0) || [];
+
+    // Decompress frames
+    for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
+      const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
+      const sourceFrame = descriptors[outputFrame].index;
+
+      // We assume 1 fragment per frame. If multi-fragment per frame, this logic needs improvement.
+      if (sourceFrame >= fragments.length) {
+        throw new Error(`Недостаточно фрагментов сжатых данных. Кадр: ${sourceFrame}, Фрагментов: ${fragments.length}`);
+      }
+
+      const fragment = fragments[sourceFrame];
+      const compressedBytes = new Uint8Array(buffer, pixelElement.dataOffset + fragment.offset, fragment.length);
+      const destinationOffset = outputFrame * voxelsPerFrame;
+
+      let framePixels: Uint8Array | Uint16Array | Int16Array;
+      if (isLosslessJPEG) {
+        // Vite and rollup handling of CommonJS modules usually puts the default export in `default`,
+        // but TypeScript sometimes expects it directly. Check both.
+        const decoder = new JpegLosslessDecoder();
+        const decompressed = decoder.decode(compressedBytes.buffer, compressedBytes.byteOffset, compressedBytes.byteLength);
+
+        // JPEG Lossless decoder can return different ArrayBuffer views. Usually Int16/Uint16 or Uint8
+        if (bitsAllocated === 8) {
+          framePixels = new Uint8Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+        } else if (signed) {
+          framePixels = new Int16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+        } else {
+          framePixels = new Uint16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+        }
+      } else {
+        // Baseline JPEG
+        const decoded = decodeJpegBaseline(compressedBytes, { useTArray: true, colorTransform: false });
+        // jpeg-js returns RGBA by default, we need to extract the single channel
+        framePixels = new Uint8Array(voxelsPerFrame);
+        if (decoded.data.length === voxelsPerFrame) {
+          framePixels.set(decoded.data);
+        } else if (decoded.data.length === voxelsPerFrame * 4) {
+          // Extract R channel (assuming Grayscale stored in R or identical across RGB)
+          for (let i = 0; i < voxelsPerFrame; i++) {
+            framePixels[i] = decoded.data[i * 4];
+          }
+        } else {
+          throw new Error('Неожиданный размер данных после JPEG распаковки.');
+        }
+      }
+
+      for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
+        const raw = framePixels[voxel];
+        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
+        scalarData[destinationOffset + voxel] = requiresRescale
+          ? value * slope + intercept
+          : value;
+      }
+    }
+  } else {
+    for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
+      const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
+      const sourceFrame = descriptors[outputFrame].index;
+      const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel;
+      const destinationOffset = outputFrame * voxelsPerFrame;
+      for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
+        const raw = readPixelValue(
+          view,
+          sourceOffset + voxel * bytesPerPixel,
+          bitsAllocated,
+          littleEndian,
+        );
+        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
+        scalarData[destinationOffset + voxel] = requiresRescale
+          ? value * slope + intercept
+          : value;
+      }
     }
   }
 
@@ -546,18 +616,19 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
   };
 }
 
-function parseFiles(buffers: ArrayBuffer[], sourceName: string): SerializedDicomVolume {
+async function parseFiles(buffers: ArrayBuffer[], sourceName: string): Promise<SerializedDicomVolume> {
   if (buffers.length === 0) {
     throw new Error('Не найдены DICOM-файлы для загрузки.');
   }
-  if (buffers.length === 1) return parseVolume(buffers[0], sourceName);
+  if (buffers.length === 1) return await parseVolume(buffers[0], sourceName);
   const volumes: SerializedDicomVolume[] = [];
   for (const buffer of buffers) {
     const dataSet = parseDicom(new Uint8Array(buffer));
     if (dataSet.string(MEDIA_STORAGE_SOP_CLASS_TAG)?.trim() === DICOM_DIRECTORY_STORAGE_UID) {
       continue;
     }
-    volumes.push(parseVolume(buffer, `срез ${volumes.length + 1}`, dataSet));
+    const volume = await parseVolume(buffer, `срез ${volumes.length + 1}`, dataSet);
+    volumes.push(volume);
   }
   if (volumes.length === 0) {
     throw new Error('В папке найден только DICOMDIR, но нет файлов изображений. Выберите папку целиком, включая вложенную папку IMAGES.');
@@ -571,9 +642,9 @@ function parseFiles(buffers: ArrayBuffer[], sourceName: string): SerializedDicom
   return combineSlices(volumes, sourceName);
 }
 
-workerScope.onmessage = (event: MessageEvent<{ buffers: ArrayBuffer[]; sourceName: string }>) => {
+workerScope.onmessage = async (event: MessageEvent<{ buffers: ArrayBuffer[]; sourceName: string }>) => {
   try {
-    const result = parseFiles(event.data.buffers, event.data.sourceName);
+    const result = await parseFiles(event.data.buffers, event.data.sourceName);
     workerScope.postMessage(result, [result.scalarData]);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Не удалось обработать DICOM-файл.';

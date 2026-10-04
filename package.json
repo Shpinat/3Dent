@@ -10,11 +10,13 @@
   },
   "dependencies": {
     "@cornerstonejs/core": "5.11.4",
-    "@cornerstonejs/dicom-image-loader": "5.11.4",
+    "@cornerstonejs/dicom-image-loader": "^5.11.4",
     "@cornerstonejs/metadata": "5.11.4",
     "@cornerstonejs/tools": "5.11.4",
     "dicom-parser": "1.8.21",
     "events": "3.3.0",
+    "jpeg-js": "^0.4.4",
+    "jpeg-lossless-decoder-js": "^2.1.2",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "url": "0.11.4"
