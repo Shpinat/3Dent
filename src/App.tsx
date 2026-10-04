@@ -55,10 +55,13 @@ async function hasDicomSignature(file: File): Promise<boolean> {
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const [volume, setVolume] = useState<ParsedDicomVolume | null>(null);
+  const [studies, setStudies] = useState<{ id: string, volume: ParsedDicomVolume }[]>([]);
+  const [activeStudyId, setActiveStudyId] = useState<string | null>(null);
   const [loading, setLoading] = useState<LoadingState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+
+  const activeVolume = studies.find(s => s.id === activeStudyId)?.volume || null;
 
   const handleProgress = useCallback((progress: ReadProgress) => {
     if (progress.stage === 'parsing') {
@@ -77,7 +80,6 @@ export default function App() {
       setLoading(null);
       return;
     }
-    setVolume(null);
     setError(null);
     setLoading({ message: 'Подготовка чтения…', progress: 0 });
     try {
@@ -92,12 +94,24 @@ export default function App() {
         }
       }
       const parsedVolume = await readDicomFiles(dicomFiles, handleProgress);
-      setVolume(parsedVolume);
+      const newStudyId = crypto.randomUUID();
+      setStudies(prev => [...prev, { id: newStudyId, volume: parsedVolume }]);
+      setActiveStudyId(newStudyId);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Не удалось загрузить файл.');
       setLoading(null);
     }
   }, [handleProgress]);
+
+  const removeStudy = useCallback((idToRemove: string) => {
+    setStudies(prev => {
+      const filtered = prev.filter(s => s.id !== idToRemove);
+      if (activeStudyId === idToRemove) {
+        setActiveStudyId(filtered.length > 0 ? filtered[filtered.length - 1].id : null);
+      }
+      return filtered;
+    });
+  }, [activeStudyId]);
 
   const handleReady = useCallback(() => setLoading(null), []);
   const handleViewerStatus = useCallback((message: string, progress: number) => {
@@ -106,8 +120,8 @@ export default function App() {
   const handleViewerError = useCallback((message: string) => {
     setError(message);
     setLoading(null);
-    setVolume(null);
-  }, []);
+    if (activeStudyId) removeStudy(activeStudyId);
+  }, [activeStudyId, removeStudy]);
 
   const handleDrop = async (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
@@ -136,13 +150,54 @@ export default function App() {
           </div>
         </div>
         <div className="header-status">
-          <span className={`status-indicator${volume ? ' status-indicator--ready' : ''}`} />
-          {volume ? 'Локальный просмотр' : 'Ожидание файла'}
+          <span className={`status-indicator${studies.length > 0 ? ' status-indicator--ready' : ''}`} />
+          {studies.length > 0 ? 'Локальный просмотр' : 'Ожидание файла'}
         </div>
       </header>
 
-      <section
-        className={`workspace${dragging ? ' workspace--dragging' : ''}`}
+      <div className="main-layout">
+        {studies.length > 0 && (
+          <aside className="study-manager">
+            <div className="study-manager-header">
+              <h3>Менеджер исследований</h3>
+              <div className="study-manager-actions">
+                <button className="change-file-button" onClick={() => inputRef.current?.click()}>
+                  + Файл
+                </button>
+                <button className="change-file-button" onClick={() => folderInputRef.current?.click()}>
+                  + Папка
+                </button>
+              </div>
+            </div>
+            <ul className="study-list">
+              {studies.map((study) => (
+                <li
+                  key={study.id}
+                  className={`study-item${study.id === activeStudyId ? ' study-item--active' : ''}`}
+                  onClick={() => setActiveStudyId(study.id)}
+                >
+                  <div className="study-item-info">
+                    <strong>{study.volume.sourceName}</strong>
+                    <span>{study.volume.modality} · {study.volume.dimensions[0]}×{study.volume.dimensions[1]}×{study.volume.numberOfFrames}</span>
+                  </div>
+                  <button
+                    className="study-item-remove"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeStudy(study.id);
+                    }}
+                    title="Закрыть исследование"
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </aside>
+        )}
+
+        <section
+          className={`workspace${dragging ? ' workspace--dragging' : ''}`}
         onDragOver={(event) => {
           event.preventDefault();
           setDragging(true);
@@ -150,41 +205,35 @@ export default function App() {
         onDragLeave={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
         }}
-        onDrop={handleDrop}
-      >
-        {volume ? (
-          <>
-            <div className="study-bar">
-              <div className="study-title">
-                <span className="study-icon" aria-hidden="true">▦</span>
-                <div>
-                  <p className="eyebrow">ТЕКУЩЕЕ ИССЛЕДОВАНИЕ</p>
-                  <strong title={volume.sourceName}>{volume.sourceName}</strong>
+          onDrop={handleDrop}
+        >
+          {activeVolume ? (
+            <>
+              <div className="study-bar">
+                <div className="study-title">
+                  <span className="study-icon" aria-hidden="true">▦</span>
+                  <div>
+                    <p className="eyebrow">ТЕКУЩЕЕ ИССЛЕДОВАНИЕ</p>
+                    <strong title={activeVolume.sourceName}>{activeVolume.sourceName}</strong>
+                  </div>
+                </div>
+                <div className="study-meta">
+                  <span>{activeVolume.modality}</span>
+                  <span>{activeVolume.dimensions[0]} × {activeVolume.dimensions[1]} × {activeVolume.numberOfFrames}</span>
+                  <span>{activeVolume.spacing[0].toFixed(2)} × {activeVolume.spacing[1].toFixed(2)} × {activeVolume.spacing[2].toFixed(2)} mm</span>
                 </div>
               </div>
-              <div className="study-meta">
-                <span>{volume.modality}</span>
-                <span>{volume.dimensions[0]} × {volume.dimensions[1]} × {volume.numberOfFrames}</span>
-                <span>{volume.spacing[0].toFixed(2)} × {volume.spacing[1].toFixed(2)} × {volume.spacing[2].toFixed(2)} mm</span>
-              </div>
-              <button className="change-file-button" onClick={() => inputRef.current?.click()}>
-                Открыть файл
-              </button>
-              <button className="change-file-button" onClick={() => folderInputRef.current?.click()}>
-                Открыть папку
-              </button>
-            </div>
-            <Suspense fallback={null}>
-              <MprViewer
-                volume={volume}
-                onStatus={handleViewerStatus}
-                onReady={handleReady}
-                onError={handleViewerError}
-              />
-            </Suspense>
-          </>
-        ) : (
-          <div className="empty-state">
+              <Suspense fallback={null}>
+                <MprViewer
+                  volume={activeVolume}
+                  onStatus={handleViewerStatus}
+                  onReady={handleReady}
+                  onError={handleViewerError}
+                />
+              </Suspense>
+            </>
+          ) : (
+            <div className="empty-state">
             <div className="scan-illustration" aria-hidden="true">
               <div className="scan-ring scan-ring--outer" />
               <div className="scan-ring scan-ring--middle" />
@@ -208,8 +257,9 @@ export default function App() {
               <span aria-hidden="true">◈</span> Файл обрабатывается только в браузере и не отправляется на сервер
             </p>
           </div>
-        )}
-      </section>
+          )}
+        </section>
+      </div>
 
       <footer className="app-footer">
         <span>3Dent Viewer <span className="footer-separator">/</span> MPR</span>
