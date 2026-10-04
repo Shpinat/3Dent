@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useRef, useState } from 'react';
 import { readDicomFiles, type ReadProgress } from './dicom/readDicomFile';
 import type { ParsedDicomVolume, VolumeSavedState } from './dicom/types';
 
@@ -72,17 +72,6 @@ export default function App() {
   const [loading, setLoading] = useState<LoadingState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [memoryUsed, setMemoryUsed] = useState<number | null>(null);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if ((performance as any).memory) {
-        setMemoryUsed(Math.round((performance as any).memory.usedJSHeapSize / 1024 / 1024));
-      }
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, []);
 
   const activeStudy = studies.find(s => s.id === activeStudyId);
   const activeVolume = activeStudy?.volume || null;
@@ -219,11 +208,6 @@ export default function App() {
         </div>
         <div className="header-status">
           <span className={`status-indicator${studies.length > 0 ? ' status-indicator--ready' : ''}`} />
-          {memoryUsed !== null && (
-            <span style={{ marginRight: '8px', color: '#8291a1', fontSize: '11px' }}>
-              RAM: {memoryUsed} MB
-            </span>
-          )}
           {studies.length > 0 ? 'Локальный просмотр' : 'Ожидание файла'}
         </div>
       </header>
