@@ -507,16 +507,23 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
     'PixelSpacing',
     'ImageOrientationPatient',
   ] as const;
-  for (const volume of volumes.slice(1)) {
-    for (const key of requiredMetadata) {
-      const firstValue = first.metadata[key];
+  const firstValues = requiredMetadata.map(key => first.metadata[key]);
+  for (let v = 1; v < volumes.length; v++) {
+    const volume = volumes[v];
+    for (let i = 0; i < requiredMetadata.length; i++) {
+      const key = requiredMetadata[i];
+      const firstValue = firstValues[i];
       const nextValue = volume.metadata[key];
       if (Array.isArray(firstValue) && Array.isArray(nextValue)) {
-        if (firstValue.length !== nextValue.length ||
-            firstValue.some((value, index) =>
-              typeof value !== 'number' || typeof nextValue[index] !== 'number' ||
-              Math.abs(value - nextValue[index]!) > 0.0001)) {
+        if (firstValue.length !== nextValue.length) {
           throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+        }
+        for (let j = 0; j < firstValue.length; j++) {
+          const value = firstValue[j];
+          if (typeof value !== 'number' || typeof nextValue[j] !== 'number' ||
+              Math.abs(value - nextValue[j]!) > 0.0001) {
+            throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+          }
         }
       } else if (firstValue !== nextValue) {
         throw new Error('В папке найдены разные DICOM-серии. Перетащите папку только с одной серией срезов.');
