@@ -16,6 +16,12 @@ export interface ParsedDicomVolume {
   isMonochrome1: boolean;
   modality: string;
   sourceName: string;
+  patientName?: string;
+  patientId?: string;
+  studyDate?: string;
+  studyDescription?: string;
+  seriesDescription?: string;
+  manufacturer?: string;
 }
 
 export interface SerializedDicomVolume extends Omit<ParsedDicomVolume, 'scalarData'> {

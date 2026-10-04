@@ -83,6 +83,46 @@ function median(values: number[]): number {
     : sorted[middle];
 }
 
+function decodeString(value: string | undefined, specificCharacterSet: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  // DICOM parser reads as ISO-8859-1 or utf-8 loosely by default.
+  // If the dataset specifies ISO_IR 144 (Cyrillic) or ISO 2022 IR 144, or if we see moji-bake (like Âîëîäèí).
+  // We can attempt to fix it by converting back to bytes and decoding as windows-1251.
+
+  // Clean up binary nulls and trailing spaces
+  let cleaned = value.replace(/\0/g, '').trim();
+  if (cleaned.length === 0) return undefined;
+
+  // Remove formatting caret delimiters (e.g. Last^First -> Last First)
+  cleaned = cleaned.replace(/\^/g, ' ');
+
+  const hasCyrillicMojiBake = /[À-ßà-ÿ]/.test(cleaned);
+  const isCyrillicCharset = specificCharacterSet?.includes('ISO_IR 144') || specificCharacterSet?.includes('1251');
+
+  if (hasCyrillicMojiBake || isCyrillicCharset) {
+    try {
+      // Create a byte array from the character codes, which likely got read as single bytes
+      const bytes = new Uint8Array(cleaned.length);
+      for (let i = 0; i < cleaned.length; i++) {
+        bytes[i] = cleaned.charCodeAt(i) & 0xFF;
+      }
+
+      const decoder = new TextDecoder('windows-1251');
+      const decoded = decoder.decode(bytes);
+
+      // If the result actually looks like readable Cyrillic, use it
+      if (/[А-Яа-я]/.test(decoded)) {
+        return decoded.trim();
+      }
+    } catch {
+      // Fallback to cleaned original if decoding fails
+    }
+  }
+
+  return cleaned;
+}
+
 function parseVolume(
   buffer: ArrayBuffer,
   sourceName: string,
@@ -338,6 +378,17 @@ function parseVolume(
     VOILUTFunction: dataSet.string('x00281056')?.trim() ?? 'LINEAR',
   };
 
+  const specificCharacterSet = dataSet.string('x00080005');
+  const patientName = decodeString(dataSet.string('x00100010'), specificCharacterSet);
+  const patientId = decodeString(dataSet.string('x00100020'), specificCharacterSet);
+  const studyDateRaw = dataSet.string('x00080020');
+  const studyDate = studyDateRaw?.length === 8
+    ? `${studyDateRaw.slice(0,4)}-${studyDateRaw.slice(4,6)}-${studyDateRaw.slice(6,8)}`
+    : studyDateRaw;
+  const studyDescription = decodeString(dataSet.string('x00081030'), specificCharacterSet);
+  const seriesDescription = decodeString(dataSet.string('x0008103e'), specificCharacterSet);
+  const manufacturer = decodeString(dataSet.string('x00080070'), specificCharacterSet);
+
   return {
     scalarData: scalarData.buffer,
     scalarType: scalarData instanceof Int16Array
@@ -363,6 +414,12 @@ function parseVolume(
     isMonochrome1: photometricInterpretation === 'MONOCHROME1',
     modality: dataSet.string('x00080060')?.trim() ?? 'CT',
     sourceName,
+    patientName,
+    patientId,
+    studyDate,
+    studyDescription,
+    seriesDescription,
+    manufacturer,
   };
 }
 
