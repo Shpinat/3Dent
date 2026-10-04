@@ -96,38 +96,80 @@ function decodeString(dataSet: DataSet, tag: string): string | undefined {
   // Remove formatting caret delimiters (e.g. Last^First -> Last First)
   cleaned = cleaned.replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // 1. Try to read directly from raw bytes using windows-1251 decoder.
-  // This bypasses dicom-parser's internal string decoding which corrupts some Russian charsets.
-  try {
-    const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
-    const decoder1251 = new TextDecoder('windows-1251');
-    const decoded1251 = decoder1251.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
+  // Extract Specific Character Set (0008,0005)
+  // It can be a single string or multiple values separated by backslash
+  const charSetTag = dataSet.string('x00080005');
+  const charSets = charSetTag ? charSetTag.split('\\').map(s => s.trim()) : [];
+  const primaryCharSet = charSets[0] || '';
 
-    // Check if the result looks like valid Cyrillic
-    if (/[А-Яа-я]/.test(decoded1251) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded1251)) {
-      return decoded1251;
-    }
-  } catch (error) {
-    // ignore byte reading errors
+  // Determine encoding based on Specific Character Set
+  let encoding: string | undefined;
+  let force1251Fallback = false;
+
+  if (!primaryCharSet || primaryCharSet === 'ISO_IR 100') {
+    // Missing, empty, or default Latin. We use windows-1251 as fallback
+    // for medical images from CIS where Cyrillic is written over Latin.
+    force1251Fallback = true;
+    encoding = 'windows-1251';
+  } else if (primaryCharSet === 'ISO_IR 192') {
+    encoding = 'utf-8';
+  } else if (primaryCharSet === 'ISO_IR 144') {
+    encoding = 'iso-8859-5';
+  } else if (primaryCharSet === 'ISO_IR 126') {
+    encoding = 'iso-8859-7';
+  } else if (primaryCharSet === 'ISO_IR 127') {
+    encoding = 'iso-8859-8';
+  } else if (primaryCharSet === 'ISO_IR 138') {
+    encoding = 'iso-8859-9';
+  } else if (primaryCharSet === 'ISO_IR 148') {
+    encoding = 'iso-8859-9';
+  } else if (primaryCharSet === 'ISO_IR 13') {
+    encoding = 'shift-jis';
+  } else if (primaryCharSet === 'GB18030') {
+    encoding = 'gb18030';
   }
 
-  // 2. Fallback: Check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
-  const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
-  if (hasCyrillicMojiBake) {
+  // 1. Try to read directly from raw bytes using the determined encoding.
+  if (encoding) {
     try {
-      const bytes = new Uint8Array(cleaned.length);
-      for (let i = 0; i < cleaned.length; i++) {
-        bytes[i] = cleaned.charCodeAt(i) & 0xFF;
-      }
+      const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
+      const decoder = new TextDecoder(encoding);
+      const decoded = decoder.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-      const decoder = new TextDecoder('windows-1251');
-      const decoded = decoder.decode(bytes);
-
-      if (/[А-Яа-я]/.test(decoded)) {
-        return decoded.trim();
+      // If we are forcing 1251 fallback, check if it actually looks like valid Cyrillic
+      if (force1251Fallback) {
+        if (/[А-Яа-я]/.test(decoded) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded)) {
+          return decoded;
+        }
+      } else {
+        // If it's explicitly specified encoding, trust it
+        return decoded;
       }
-    } catch {
-      // Fallback to original
+    } catch (error) {
+      // ignore byte reading errors, fallback below
+    }
+  }
+
+  // 2. Fallback: If we forced 1251 and byte reading didn't work (or didn't look like Cyrillic),
+  // check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
+  if (force1251Fallback) {
+    const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
+    if (hasCyrillicMojiBake) {
+      try {
+        const bytes = new Uint8Array(cleaned.length);
+        for (let i = 0; i < cleaned.length; i++) {
+          bytes[i] = cleaned.charCodeAt(i) & 0xFF;
+        }
+
+        const decoder = new TextDecoder('windows-1251');
+        const decoded = decoder.decode(bytes);
+
+        if (/[А-Яа-я]/.test(decoded)) {
+          return decoded.trim();
+        }
+      } catch {
+        // Fallback to original
+      }
     }
   }
 

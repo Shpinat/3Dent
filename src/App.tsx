@@ -86,6 +86,15 @@ export default function App() {
       let dicomFiles = files;
       let sourceNameFallback = undefined;
 
+      // Always try to extract the folder name from webkitRelativePath
+      const path = files[0]?.webkitRelativePath;
+      if (path) {
+        const folderName = path.split('/')[0];
+        if (folderName) {
+          sourceNameFallback = folderName;
+        }
+      }
+
       if (files.length > 1) {
         dicomFiles = [];
         for (const file of files) {
@@ -94,15 +103,8 @@ export default function App() {
         if (dicomFiles.length === 0) {
           throw new Error('В выбранной папке не найдены файлы DICOM с сигнатурой DICM.');
         }
-
-        const path = files[0].webkitRelativePath;
-        if (path) {
-          const folderName = path.split('/')[0];
-          if (folderName) {
-            sourceNameFallback = folderName;
-          }
-        }
       }
+
       const parsedVolume = await readDicomFiles(dicomFiles, handleProgress, sourceNameFallback);
       const newStudyId = crypto.randomUUID();
       setStudies(prev => [...prev, { id: newStudyId, volume: parsedVolume }]);
@@ -206,8 +208,8 @@ export default function App() {
                       {study.volume.studyDate && `${study.volume.studyDate} · `}
                       {study.volume.modality}
                     </span>
-                    <span className="study-item-desc" title={study.volume.studyDescription || study.volume.seriesDescription || study.volume.sourceName}>
-                      {study.volume.studyDescription || study.volume.seriesDescription || study.volume.sourceName}
+                    <span className="study-item-desc" title={study.volume.sourceName}>
+                      {study.volume.sourceName}
                     </span>
                   </div>
                   <button
