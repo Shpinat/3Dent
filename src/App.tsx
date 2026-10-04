@@ -32,15 +32,27 @@ async function getFilesFromEntry(entry: FileSystemEntry): Promise<File[]> {
   return files.flat();
 }
 
-async function getDroppedFiles(dataTransfer: DataTransfer): Promise<File[]> {
+async function getDroppedFilesInfo(dataTransfer: DataTransfer): Promise<{ files: File[], droppedFolderName?: string }> {
   const entries = Array.from(dataTransfer.items)
     .map((item) => (item as DataTransferItem & {
       webkitGetAsEntry?: () => FileSystemEntry | null;
     }).webkitGetAsEntry?.())
     .filter((entry): entry is FileSystemEntry => entry !== null && entry !== undefined);
-  if (entries.length === 0) return Array.from(dataTransfer.files);
+
+  let droppedFolderName: string | undefined;
+  if (entries.length > 0) {
+    const firstDir = entries.find(e => e.isDirectory);
+    if (firstDir) {
+      droppedFolderName = firstDir.name;
+    }
+  }
+
+  if (entries.length === 0) {
+    return { files: Array.from(dataTransfer.files) };
+  }
+
   const files = await Promise.all(entries.map(getFilesFromEntry));
-  return files.flat();
+  return { files: files.flat(), droppedFolderName };
 }
 
 async function hasDicomSignature(file: File): Promise<boolean> {
@@ -74,7 +86,7 @@ export default function App() {
     setLoading({ message: 'Чтение файла с диска…', progress: percentage });
   }, []);
 
-  const loadFiles = useCallback(async (files: File[]) => {
+  const loadFiles = useCallback(async (files: File[], droppedFolderName?: string) => {
     if (files.length === 0) {
       setError('Папка не содержит файлов для загрузки.');
       setLoading(null);
@@ -84,14 +96,16 @@ export default function App() {
     setLoading({ message: 'Подготовка чтения…', progress: 0 });
     try {
       let dicomFiles = files;
-      let sourceNameFallback = undefined;
+      let sourceNameFallback = droppedFolderName;
 
-      // Always try to extract the folder name from webkitRelativePath
-      const path = files[0]?.webkitRelativePath;
-      if (path) {
-        const folderName = path.split('/')[0];
-        if (folderName) {
-          sourceNameFallback = folderName;
+      if (!sourceNameFallback) {
+        // Try to extract the folder name from webkitRelativePath if not provided by drag and drop
+        const path = files[0]?.webkitRelativePath;
+        if (path) {
+          const folderName = path.split('/')[0];
+          if (folderName) {
+            sourceNameFallback = folderName;
+          }
         }
       }
 
@@ -140,7 +154,8 @@ export default function App() {
     setDragging(false);
     setLoading({ message: 'Чтение содержимого папки…', progress: 0 });
     try {
-      await loadFiles(await getDroppedFiles(event.dataTransfer));
+      const { files, droppedFolderName } = await getDroppedFilesInfo(event.dataTransfer);
+      await loadFiles(files, droppedFolderName);
     } catch (dropError) {
       setError(dropError instanceof Error ? dropError.message : 'Не удалось прочитать папку.');
       setLoading(null);
