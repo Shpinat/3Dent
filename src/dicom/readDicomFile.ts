@@ -16,6 +16,7 @@ export function readDicomFile(
 export function readDicomFiles(
   files: File[],
   onProgress: (progress: ReadProgress) => void,
+  sourceNameFallback?: string,
 ): Promise<ParsedDicomVolume> {
   if (files.length === 0) {
     return Promise.reject(new Error('Не выбраны файлы DICOM для загрузки.'));
@@ -59,10 +60,11 @@ export function readDicomFiles(
       if (settled) return;
       if (index === files.length) {
         onProgress({ loaded: totalSize, total: totalSize, stage: 'parsing' });
+        const defaultName = files.length === 1 ? files[0].name : (sourceNameFallback || `DICOM серия (${files.length} срезов)`);
         worker.postMessage(
           {
             buffers,
-            sourceName: files.length === 1 ? files[0].name : `DICOM серия (${files.length} срезов)`,
+            sourceName: defaultName,
           },
           buffers,
         );
