@@ -59,21 +59,6 @@ function readPixelValue(
   return view.getUint16(offset, littleEndian);
 }
 
-function normalizePixel(
-  value: number,
-  bitsStored: number,
-  highBit: number,
-  pixelRepresentation: number,
-): number {
-  const shift = highBit - bitsStored + 1;
-  const storedValue = shift > 0 ? value >>> shift : value;
-  const mask = 2 ** bitsStored - 1;
-  const masked = storedValue & mask;
-  if (pixelRepresentation === 1 && (masked & (2 ** (bitsStored - 1))) !== 0) {
-    return masked - 2 ** bitsStored;
-  }
-  return masked;
-}
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -382,6 +367,13 @@ function parseVolume(
         : new Uint16Array(voxelCount);
   const view = new DataView(buffer);
   const voxelsPerFrame = rows * columns;
+
+  // Pre-calculate bitwise constants to optimize inner loop performance
+  const shift = highBit - bitsStored + 1;
+  const mask = (1 << bitsStored) - 1;
+  const signBit = 1 << (bitsStored - 1);
+  const signMask = 1 << bitsStored;
+
   for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
     const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
     const sourceFrame = descriptors[outputFrame].index;
@@ -394,7 +386,13 @@ function parseVolume(
         bitsAllocated,
         littleEndian,
       );
-      const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
+
+      const storedValue = shift > 0 ? raw >>> shift : raw;
+      const masked = storedValue & mask;
+      const value = (pixelRepresentation === 1 && (masked & signBit) !== 0)
+        ? masked - signMask
+        : masked;
+
       scalarData[destinationOffset + voxel] = requiresRescale
         ? value * slope + intercept
         : value;
