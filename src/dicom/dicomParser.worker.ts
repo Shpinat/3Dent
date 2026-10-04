@@ -83,26 +83,38 @@ function median(values: number[]): number {
     : sorted[middle];
 }
 
-function decodeString(value: string | undefined, specificCharacterSet: string | undefined): string | undefined {
-  if (!value) return undefined;
+function decodeString(dataSet: DataSet, tag: string): string | undefined {
+  const element = dataSet.elements[tag];
+  if (!element || element.length === 0) return undefined;
 
-  // DICOM parser reads as ISO-8859-1 or utf-8 loosely by default.
-  // If the dataset specifies ISO_IR 144 (Cyrillic) or ISO 2022 IR 144, or if we see moji-bake (like Âîëîäèí).
-  // We can attempt to fix it by converting back to bytes and decoding as windows-1251.
+  const rawString = dataSet.string(tag);
+  if (!rawString) return undefined;
 
-  // Clean up binary nulls and trailing spaces
-  let cleaned = value.replace(/\0/g, '').trim();
+  let cleaned = rawString.replace(/\0/g, '').trim();
   if (cleaned.length === 0) return undefined;
 
   // Remove formatting caret delimiters (e.g. Last^First -> Last First)
-  cleaned = cleaned.replace(/\^/g, ' ');
+  cleaned = cleaned.replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-  const hasCyrillicMojiBake = /[À-ßà-ÿ]/.test(cleaned);
-  const isCyrillicCharset = specificCharacterSet?.includes('ISO_IR 144') || specificCharacterSet?.includes('1251');
+  // 1. Try to read directly from raw bytes using windows-1251 decoder.
+  // This bypasses dicom-parser's internal string decoding which corrupts some Russian charsets.
+  try {
+    const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
+    const decoder1251 = new TextDecoder('windows-1251');
+    const decoded1251 = decoder1251.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-  if (hasCyrillicMojiBake || isCyrillicCharset) {
+    // Check if the result looks like valid Cyrillic
+    if (/[А-Яа-я]/.test(decoded1251) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded1251)) {
+      return decoded1251;
+    }
+  } catch (error) {
+    // ignore byte reading errors
+  }
+
+  // 2. Fallback: Check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
+  const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
+  if (hasCyrillicMojiBake) {
     try {
-      // Create a byte array from the character codes, which likely got read as single bytes
       const bytes = new Uint8Array(cleaned.length);
       for (let i = 0; i < cleaned.length; i++) {
         bytes[i] = cleaned.charCodeAt(i) & 0xFF;
@@ -111,12 +123,11 @@ function decodeString(value: string | undefined, specificCharacterSet: string | 
       const decoder = new TextDecoder('windows-1251');
       const decoded = decoder.decode(bytes);
 
-      // If the result actually looks like readable Cyrillic, use it
       if (/[А-Яа-я]/.test(decoded)) {
         return decoded.trim();
       }
     } catch {
-      // Fallback to cleaned original if decoding fails
+      // Fallback to original
     }
   }
 
@@ -378,16 +389,15 @@ function parseVolume(
     VOILUTFunction: dataSet.string('x00281056')?.trim() ?? 'LINEAR',
   };
 
-  const specificCharacterSet = dataSet.string('x00080005');
-  const patientName = decodeString(dataSet.string('x00100010'), specificCharacterSet);
-  const patientId = decodeString(dataSet.string('x00100020'), specificCharacterSet);
+  const patientName = decodeString(dataSet, 'x00100010');
+  const patientId = decodeString(dataSet, 'x00100020');
   const studyDateRaw = dataSet.string('x00080020');
   const studyDate = studyDateRaw?.length === 8
     ? `${studyDateRaw.slice(0,4)}-${studyDateRaw.slice(4,6)}-${studyDateRaw.slice(6,8)}`
     : studyDateRaw;
-  const studyDescription = decodeString(dataSet.string('x00081030'), specificCharacterSet);
-  const seriesDescription = decodeString(dataSet.string('x0008103e'), specificCharacterSet);
-  const manufacturer = decodeString(dataSet.string('x00080070'), specificCharacterSet);
+  const studyDescription = decodeString(dataSet, 'x00081030');
+  const seriesDescription = decodeString(dataSet, 'x0008103e');
+  const manufacturer = decodeString(dataSet, 'x00080070');
 
   return {
     scalarData: scalarData.buffer,

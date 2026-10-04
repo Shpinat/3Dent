@@ -84,6 +84,8 @@ export default function App() {
     setLoading({ message: 'Подготовка чтения…', progress: 0 });
     try {
       let dicomFiles = files;
+      let sourceNameFallback = undefined;
+
       if (files.length > 1) {
         dicomFiles = [];
         for (const file of files) {
@@ -92,8 +94,16 @@ export default function App() {
         if (dicomFiles.length === 0) {
           throw new Error('В выбранной папке не найдены файлы DICOM с сигнатурой DICM.');
         }
+
+        const path = files[0].webkitRelativePath;
+        if (path) {
+          const folderName = path.split('/')[0];
+          if (folderName) {
+            sourceNameFallback = folderName;
+          }
+        }
       }
-      const parsedVolume = await readDicomFiles(dicomFiles, handleProgress);
+      const parsedVolume = await readDicomFiles(dicomFiles, handleProgress, sourceNameFallback);
       const newStudyId = crypto.randomUUID();
       setStudies(prev => [...prev, { id: newStudyId, volume: parsedVolume }]);
       setActiveStudyId(newStudyId);
