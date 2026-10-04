@@ -59,21 +59,6 @@ function readPixelValue(
   return view.getUint16(offset, littleEndian);
 }
 
-function normalizePixel(
-  value: number,
-  bitsStored: number,
-  highBit: number,
-  pixelRepresentation: number,
-): number {
-  const shift = highBit - bitsStored + 1;
-  const storedValue = shift > 0 ? value >>> shift : value;
-  const mask = 2 ** bitsStored - 1;
-  const masked = storedValue & mask;
-  if (pixelRepresentation === 1 && (masked & (2 ** (bitsStored - 1))) !== 0) {
-    return masked - 2 ** bitsStored;
-  }
-  return masked;
-}
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -388,6 +373,13 @@ async function parseVolume(
         : new Uint16Array(voxelCount);
   const view = new DataView(buffer);
   const voxelsPerFrame = rows * columns;
+
+  // Pre-calculate bitwise constants to optimize inner loop performance
+  const shift = highBit - bitsStored + 1;
+  const mask = (1 << bitsStored) - 1;
+  const signBit = 1 << (bitsStored - 1);
+  const signMask = 1 << bitsStored;
+
   for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
     const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
     const sourceFrame = descriptors[outputFrame].index;
@@ -424,6 +416,23 @@ async function parseVolume(
           ? value * slope + intercept
           : value;
       }
+    for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
+      const raw = readPixelValue(
+        view,
+        sourceOffset + voxel * bytesPerPixel,
+        bitsAllocated,
+        littleEndian,
+      );
+
+      const storedValue = shift > 0 ? raw >>> shift : raw;
+      const masked = storedValue & mask;
+      const value = (pixelRepresentation === 1 && (masked & signBit) !== 0)
+        ? masked - signMask
+        : masked;
+
+      scalarData[destinationOffset + voxel] = requiresRescale
+        ? value * slope + intercept
+        : value;
     }
   }
 
@@ -535,16 +544,23 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
     'PixelSpacing',
     'ImageOrientationPatient',
   ] as const;
-  for (const volume of volumes.slice(1)) {
-    for (const key of requiredMetadata) {
-      const firstValue = first.metadata[key];
+  const firstValues = requiredMetadata.map(key => first.metadata[key]);
+  for (let v = 1; v < volumes.length; v++) {
+    const volume = volumes[v];
+    for (let i = 0; i < requiredMetadata.length; i++) {
+      const key = requiredMetadata[i];
+      const firstValue = firstValues[i];
       const nextValue = volume.metadata[key];
       if (Array.isArray(firstValue) && Array.isArray(nextValue)) {
-        if (firstValue.length !== nextValue.length ||
-            firstValue.some((value, index) =>
-              typeof value !== 'number' || typeof nextValue[index] !== 'number' ||
-              Math.abs(value - nextValue[index]!) > 0.0001)) {
+        if (firstValue.length !== nextValue.length) {
           throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+        }
+        for (let j = 0; j < firstValue.length; j++) {
+          const value = firstValue[j];
+          if (typeof value !== 'number' || typeof nextValue[j] !== 'number' ||
+              Math.abs(value - nextValue[j]!) > 0.0001) {
+            throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+          }
         }
       } else if (firstValue !== nextValue) {
         throw new Error('В папке найдены разные DICOM-серии. Перетащите папку только с одной серией срезов.');
