@@ -61,21 +61,6 @@ function readPixelValue(
   return view.getUint16(offset, littleEndian);
 }
 
-function normalizePixel(
-  value: number,
-  bitsStored: number,
-  highBit: number,
-  pixelRepresentation: number,
-): number {
-  const shift = highBit - bitsStored + 1;
-  const storedValue = shift > 0 ? value >>> shift : value;
-  const mask = 2 ** bitsStored - 1;
-  const masked = storedValue & mask;
-  if (pixelRepresentation === 1 && (masked & (2 ** (bitsStored - 1))) !== 0) {
-    return masked - 2 ** bitsStored;
-  }
-  return masked;
-}
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -98,38 +83,80 @@ function decodeString(dataSet: DataSet, tag: string): string | undefined {
   // Remove formatting caret delimiters (e.g. Last^First -> Last First)
   cleaned = cleaned.replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // 1. Try to read directly from raw bytes using windows-1251 decoder.
-  // This bypasses dicom-parser's internal string decoding which corrupts some Russian charsets.
-  try {
-    const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
-    const decoder1251 = new TextDecoder('windows-1251');
-    const decoded1251 = decoder1251.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
+  // Extract Specific Character Set (0008,0005)
+  // It can be a single string or multiple values separated by backslash
+  const charSetTag = dataSet.string('x00080005');
+  const charSets = charSetTag ? charSetTag.split('\\').map(s => s.trim()) : [];
+  const primaryCharSet = charSets[0] || '';
 
-    // Check if the result looks like valid Cyrillic
-    if (/[А-Яа-я]/.test(decoded1251) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded1251)) {
-      return decoded1251;
-    }
-  } catch (error) {
-    // ignore byte reading errors
+  // Determine encoding based on Specific Character Set
+  let encoding: string | undefined;
+  let force1251Fallback = false;
+
+  if (!primaryCharSet || primaryCharSet === 'ISO_IR 100') {
+    // Missing, empty, or default Latin. We use windows-1251 as fallback
+    // for medical images from CIS where Cyrillic is written over Latin.
+    force1251Fallback = true;
+    encoding = 'windows-1251';
+  } else if (primaryCharSet === 'ISO_IR 192') {
+    encoding = 'utf-8';
+  } else if (primaryCharSet === 'ISO_IR 144') {
+    encoding = 'iso-8859-5';
+  } else if (primaryCharSet === 'ISO_IR 126') {
+    encoding = 'iso-8859-7';
+  } else if (primaryCharSet === 'ISO_IR 127') {
+    encoding = 'iso-8859-8';
+  } else if (primaryCharSet === 'ISO_IR 138') {
+    encoding = 'iso-8859-9';
+  } else if (primaryCharSet === 'ISO_IR 148') {
+    encoding = 'iso-8859-9';
+  } else if (primaryCharSet === 'ISO_IR 13') {
+    encoding = 'shift-jis';
+  } else if (primaryCharSet === 'GB18030') {
+    encoding = 'gb18030';
   }
 
-  // 2. Fallback: Check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
-  const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
-  if (hasCyrillicMojiBake) {
+  // 1. Try to read directly from raw bytes using the determined encoding.
+  if (encoding) {
     try {
-      const bytes = new Uint8Array(cleaned.length);
-      for (let i = 0; i < cleaned.length; i++) {
-        bytes[i] = cleaned.charCodeAt(i) & 0xFF;
-      }
+      const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
+      const decoder = new TextDecoder(encoding);
+      const decoded = decoder.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-      const decoder = new TextDecoder('windows-1251');
-      const decoded = decoder.decode(bytes);
-
-      if (/[А-Яа-я]/.test(decoded)) {
-        return decoded.trim();
+      // If we are forcing 1251 fallback, check if it actually looks like valid Cyrillic
+      if (force1251Fallback) {
+        if (/[А-Яа-я]/.test(decoded) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded)) {
+          return decoded;
+        }
+      } else {
+        // If it's explicitly specified encoding, trust it
+        return decoded;
       }
-    } catch {
-      // Fallback to original
+    } catch (error) {
+      // ignore byte reading errors, fallback below
+    }
+  }
+
+  // 2. Fallback: If we forced 1251 and byte reading didn't work (or didn't look like Cyrillic),
+  // check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
+  if (force1251Fallback) {
+    const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
+    if (hasCyrillicMojiBake) {
+      try {
+        const bytes = new Uint8Array(cleaned.length);
+        for (let i = 0; i < cleaned.length; i++) {
+          bytes[i] = cleaned.charCodeAt(i) & 0xFF;
+        }
+
+        const decoder = new TextDecoder('windows-1251');
+        const decoded = decoder.decode(bytes);
+
+        if (/[А-Яа-я]/.test(decoded)) {
+          return decoded.trim();
+        }
+      } catch {
+        // Fallback to original
+      }
     }
   }
 
@@ -537,16 +564,23 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
     'PixelSpacing',
     'ImageOrientationPatient',
   ] as const;
-  for (const volume of volumes.slice(1)) {
-    for (const key of requiredMetadata) {
-      const firstValue = first.metadata[key];
+  const firstValues = requiredMetadata.map(key => first.metadata[key]);
+  for (let v = 1; v < volumes.length; v++) {
+    const volume = volumes[v];
+    for (let i = 0; i < requiredMetadata.length; i++) {
+      const key = requiredMetadata[i];
+      const firstValue = firstValues[i];
       const nextValue = volume.metadata[key];
       if (Array.isArray(firstValue) && Array.isArray(nextValue)) {
-        if (firstValue.length !== nextValue.length ||
-            firstValue.some((value, index) =>
-              typeof value !== 'number' || typeof nextValue[index] !== 'number' ||
-              Math.abs(value - nextValue[index]!) > 0.0001)) {
+        if (firstValue.length !== nextValue.length) {
           throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+        }
+        for (let j = 0; j < firstValue.length; j++) {
+          const value = firstValue[j];
+          if (typeof value !== 'number' || typeof nextValue[j] !== 'number' ||
+              Math.abs(value - nextValue[j]!) > 0.0001) {
+            throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+          }
         }
       } else if (firstValue !== nextValue) {
         throw new Error('В папке найдены разные DICOM-серии. Перетащите папку только с одной серией срезов.');

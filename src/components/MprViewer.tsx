@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as cornerstone from '@cornerstonejs/core';
 import * as cornerstoneTools from '@cornerstonejs/tools';
-import type { ParsedDicomVolume } from '../dicom/types';
+import type { ParsedDicomVolume, VolumeSavedState } from '../dicom/types';
 import { initializeCornerstone } from '../cornerstone';
 
 const VIEWPORTS = [
@@ -29,7 +29,9 @@ class CursorCrosshairsTool extends cornerstoneTools.CrosshairsTool {
         return Array.isArray(rotationPoints) && rotationPoints.some((handle: unknown) => {
           if (!Array.isArray(handle) || !isPoint3(handle[0])) return false;
           const point = viewport.worldToCanvas(handle[0]);
-          return Math.hypot(point[0] - pointer[0], point[1] - pointer[1]) <= 8;
+          const dx = point[0] - pointer[0];
+          const dy = point[1] - pointer[1];
+          return dx * dx + dy * dy <= 64;
         });
       });
       const needsRender = mouseMoveCallback(...eventArgs);
@@ -90,62 +92,77 @@ function createSynchronizedWindowLevelTool(
 }
 
 interface MprViewerProps {
+  studyId: string;
   volume: ParsedDicomVolume;
+  savedState?: VolumeSavedState;
+  onSaveState?: (state: VolumeSavedState) => void;
   onStatus: (message: string, progress: number) => void;
   onReady: () => void;
   onError: (message: string) => void;
 }
 
-export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps) {
+const renderingEngineId = 'mpr-engine-shared';
+const toolGroupId = 'mpr-tools-shared';
+
+export function MprViewer({ studyId, volume, savedState, onSaveState, onStatus, onReady, onError }: MprViewerProps) {
   const elementRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const engineRef = useRef<cornerstone.RenderingEngine | null>(null);
+  const toolGroupRef = useRef<ReturnType<typeof cornerstoneTools.ToolGroupManager.getToolGroup> | null>(null);
+  const localImageMetadataProviderRef = useRef<((type: string, ...queries: unknown[]) => unknown) | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
 
   useEffect(() => {
     let disposed = false;
-    let renderingEngine: cornerstone.RenderingEngine | undefined;
-    let toolGroupId: string | undefined;
-    let volumeId: string | undefined;
-    let localImageMetadataProvider:
-      | ((type: string, ...queries: unknown[]) => unknown)
-      | undefined;
-    let resizeObserver: ResizeObserver | undefined;
 
-    const suffix = crypto.randomUUID();
-    const renderingEngineId = `mpr-engine-${suffix}`;
-
-    const setup = async () => {
+    const setupEngine = async () => {
       try {
-        onStatus('Инициализация WebGL и MPR…', 93);
-        await initializeCornerstone();
+        if (!engineRef.current) {
+          onStatus('Инициализация WebGL и MPR…', 93);
+          await initializeCornerstone();
+          if (disposed) return;
+          engineRef.current = new cornerstone.RenderingEngine(renderingEngineId);
+        }
+
+        const renderingEngine = engineRef.current;
+        if (!renderingEngine) {
+           throw new Error('Не удалось инициализировать движок рендеринга');
+        }
         if (disposed) return;
 
-        toolGroupId = `mpr-tools-${suffix}`;
-        volumeId = `local:dicom-volume-${suffix}`;
-        renderingEngine = new cornerstone.RenderingEngine(renderingEngineId);
+        // Setup viewports if they don't exist yet in the engine
+        const existingViewports = renderingEngine.getViewports();
+        if (existingViewports.length === 0) {
+          const viewportInputs = VIEWPORTS.map(({ id, orientation }) => {
+            const element = elementRefs.current[id];
+            if (!element) throw new Error(`Не найдено окно ${id} для рендеринга.`);
+            return {
+              viewportId: id,
+              type: cornerstone.Enums.ViewportType.ORTHOGRAPHIC,
+              element,
+              defaultOptions: {
+                orientation,
+                background: [0.025, 0.035, 0.05] as [number, number, number],
+              },
+            };
+          });
+          renderingEngine.setViewports(viewportInputs);
+        }
 
-        const viewportInputs = VIEWPORTS.map(({ id, orientation }) => {
-          const element = elementRefs.current[id];
-          if (!element) throw new Error(`Не найдено окно ${id} для рендеринга.`);
-          return {
-            viewportId: id,
-            type: cornerstone.Enums.ViewportType.ORTHOGRAPHIC,
-            element,
-            defaultOptions: {
-              orientation,
-              background: [0.025, 0.035, 0.05] as [number, number, number],
-            },
-          };
-        });
-        renderingEngine.setViewports(viewportInputs);
+        const volumeId = `local:dicom-volume-${studyId}`;
 
         onStatus('Создание 3D-объема…', 96);
-        const volumeObject = cornerstone.volumeLoader.createLocalVolume(volumeId, {
-          metadata: volume.metadata,
-          dimensions: volume.dimensions,
-          spacing: volume.spacing,
-          origin: volume.origin,
-          direction: volume.direction,
-          scalarData: volume.scalarData,
-        });
+        let volumeObject = cornerstone.cache.getVolume(volumeId);
+        if (!volumeObject) {
+          volumeObject = cornerstone.volumeLoader.createLocalVolume(volumeId, {
+            metadata: volume.metadata,
+            dimensions: volume.dimensions,
+            spacing: volume.spacing,
+            origin: volume.origin,
+            direction: volume.direction,
+            scalarData: volume.scalarData,
+          });
+        }
+
         if (!volumeObject) throw new Error('Cornerstone не создал локальный том.');
         const imageIds = volumeObject.imageIds;
         if (!imageIds || imageIds.length !== volume.numberOfFrames) {
@@ -187,13 +204,18 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
               imagePositionPatient[2] * normal[2],
           });
         });
-        localImageMetadataProvider = (type, ...queries) => {
+
+        if (localImageMetadataProviderRef.current) {
+          cornerstone.metaData.removeProvider(localImageMetadataProviderRef.current);
+        }
+        const localImageMetadataProvider = (type: string, ...queries: unknown[]) => {
           const imageId = queries[0];
           if (type !== cornerstone.Enums.MetadataModules.IMAGE_PLANE || typeof imageId !== 'string') {
             return undefined;
           }
           return imagePlaneMetadata.get(imageId);
         };
+        localImageMetadataProviderRef.current = localImageMetadataProvider;
         cornerstone.metaData.addProvider(localImageMetadataProvider, 1000);
 
         const viewports = VIEWPORTS.map(({ id }) => {
@@ -203,7 +225,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
           }
           return viewport;
         });
-        await Promise.all(viewports.map((viewport) => viewport.setVolumes([{ volumeId: volumeId! }])));
+        await Promise.all(viewports.map((viewport) => viewport.setVolumes([{ volumeId: volumeId }])));
         for (const viewport of viewports) {
           viewport.setProperties({
             voiRange: {
@@ -214,40 +236,74 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
           });
         }
 
-        const SynchronizedWindowLevelTool = createSynchronizedWindowLevelTool(
-          viewports,
-          `WindowLevel-${suffix}`,
-        );
-        cornerstoneTools.addTool(CursorCrosshairsTool);
-        cornerstoneTools.addTool(SynchronizedWindowLevelTool);
-        cornerstoneTools.addTool(cornerstoneTools.PanTool);
-        cornerstoneTools.addTool(cornerstoneTools.ZoomTool);
-        const toolGroup = cornerstoneTools.ToolGroupManager.createToolGroup(toolGroupId);
-        if (!toolGroup) throw new Error('Не удалось создать группу инструментов Cornerstone.');
-        for (const { id } of VIEWPORTS) toolGroup.addViewport(id, renderingEngineId);
-        toolGroup.addTool(CursorCrosshairsTool.toolName);
-        toolGroup.addTool(SynchronizedWindowLevelTool.toolName);
-        toolGroup.addTool(cornerstoneTools.PanTool.toolName);
-        toolGroup.addTool(cornerstoneTools.ZoomTool.toolName);
-        toolGroup.setToolActive(CursorCrosshairsTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Primary }],
-        });
-        toolGroup.setToolActive(SynchronizedWindowLevelTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Secondary }],
-        });
-        toolGroup.setToolActive(cornerstoneTools.PanTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Auxiliary }],
-        });
-        toolGroup.setToolActive(cornerstoneTools.ZoomTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Wheel }],
-        });
+        if (!toolGroupRef.current) {
+          const SynchronizedWindowLevelTool = createSynchronizedWindowLevelTool(
+            viewports,
+            `WindowLevel-shared`,
+          );
+
+          if (!cornerstoneTools.state.tools[CursorCrosshairsTool.toolName]) cornerstoneTools.addTool(CursorCrosshairsTool);
+          if (!cornerstoneTools.state.tools[SynchronizedWindowLevelTool.toolName]) cornerstoneTools.addTool(SynchronizedWindowLevelTool);
+          if (!cornerstoneTools.state.tools[cornerstoneTools.PanTool.toolName]) cornerstoneTools.addTool(cornerstoneTools.PanTool);
+          if (!cornerstoneTools.state.tools[cornerstoneTools.ZoomTool.toolName]) cornerstoneTools.addTool(cornerstoneTools.ZoomTool);
+
+          let toolGroup = cornerstoneTools.ToolGroupManager.getToolGroup(toolGroupId) || cornerstoneTools.ToolGroupManager.createToolGroup(toolGroupId);
+          if (!toolGroup) throw new Error('Не удалось создать группу инструментов Cornerstone.');
+          toolGroupRef.current = toolGroup;
+
+          for (const { id } of VIEWPORTS) toolGroup.addViewport(id, renderingEngineId);
+          toolGroup.addTool(CursorCrosshairsTool.toolName);
+          toolGroup.addTool(SynchronizedWindowLevelTool.toolName);
+          toolGroup.addTool(cornerstoneTools.PanTool.toolName);
+          toolGroup.addTool(cornerstoneTools.ZoomTool.toolName);
+          toolGroup.setToolActive(CursorCrosshairsTool.toolName, {
+            bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Primary }],
+          });
+          toolGroup.setToolActive(SynchronizedWindowLevelTool.toolName, {
+            bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Secondary }],
+          });
+          toolGroup.setToolActive(cornerstoneTools.PanTool.toolName, {
+            bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Auxiliary }],
+          });
+          toolGroup.setToolActive(cornerstoneTools.ZoomTool.toolName, {
+            bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Wheel }],
+          });
+        }
 
         renderingEngine.render();
-        resizeObserver = new ResizeObserver(() => renderingEngine?.resize(true, true));
+
+        if (savedState) {
+          VIEWPORTS.forEach(({ id }) => {
+            const viewport = renderingEngine?.getViewport(id);
+            const viewportState = savedState.viewports[id];
+            if (viewport && viewport instanceof cornerstone.VolumeViewport && viewportState) {
+              if (viewportState.camera) {
+                viewport.setCamera(viewportState.camera);
+              }
+              if (viewportState.voi) {
+                const voiRange = {
+                  lower: viewportState.voi.windowCenter - viewportState.voi.windowWidth / 2,
+                  upper: viewportState.voi.windowCenter + viewportState.voi.windowWidth / 2,
+                };
+                viewport.setProperties({ voiRange });
+              }
+            }
+          });
+          renderingEngine.render();
+        }
+
+        if (resizeObserverRef.current) {
+           resizeObserverRef.current.disconnect();
+        }
+
+        resizeObserverRef.current = new ResizeObserver(() => {
+            engineRef.current?.resize(true, true);
+        });
         for (const { id } of VIEWPORTS) {
           const element = elementRefs.current[id];
-          if (element) resizeObserver.observe(element);
+          if (element) resizeObserverRef.current.observe(element);
         }
+
         if (!disposed) onReady();
       } catch (error) {
         if (!disposed) {
@@ -256,35 +312,55 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
       }
     };
 
-    void setup();
+    void setupEngine();
     return () => {
       disposed = true;
-      resizeObserver?.disconnect();
+      resizeObserverRef.current?.disconnect();
       
-      if (localImageMetadataProvider) {
-        cornerstone.metaData.removeProvider(localImageMetadataProvider);
+      if (engineRef.current && onSaveState) {
+        const stateToSave: VolumeSavedState = { viewports: {} };
+        VIEWPORTS.forEach(({ id }) => {
+          const viewport = engineRef.current?.getViewport(id);
+          if (viewport && viewport instanceof cornerstone.VolumeViewport) {
+            const camera = viewport.getCamera();
+            const properties = viewport.getProperties();
+            stateToSave.viewports[id] = {
+              camera,
+              voi: properties?.voiRange ? {
+                windowWidth: properties.voiRange.upper - properties.voiRange.lower,
+                windowCenter: (properties.voiRange.upper + properties.voiRange.lower) / 2,
+              } : undefined,
+            };
+          }
+        });
+        onSaveState(stateToSave);
       }
-      
-      if (toolGroupId) {
-        const toolGroup = cornerstoneTools.ToolGroupManager.getToolGroup(toolGroupId);
-        if (toolGroup) {
-          VIEWPORTS.forEach(({ id }) => toolGroup.removeViewports(renderingEngineId, id));
-        }
-        cornerstoneTools.ToolGroupManager.destroyToolGroup(toolGroupId);
-      }
-      
-      if (renderingEngine) {
-        renderingEngine.destroy();
-      }
-      
-      if (volumeId && cornerstone.cache.getVolume(volumeId)) {
-        cornerstone.cache.removeVolumeLoadObject(volumeId);
-      }
-      
-      // Critical for 180MB files: completely purge cache and WebGL textures
-      cornerstone.cache.purgeCache();
     };
-  }, [onError, onReady, onStatus, volume]);
+  }, [studyId, volume, savedState, onSaveState, onStatus, onReady, onError]);
+
+  // Cleanup effect when the component entirely unmounts
+  useEffect(() => {
+      return () => {
+          if (localImageMetadataProviderRef.current) {
+              cornerstone.metaData.removeProvider(localImageMetadataProviderRef.current);
+              localImageMetadataProviderRef.current = null;
+          }
+
+          if (toolGroupRef.current) {
+            VIEWPORTS.forEach(({ id }) => toolGroupRef.current?.removeViewports(renderingEngineId, id));
+            cornerstoneTools.ToolGroupManager.destroyToolGroup(toolGroupId);
+            toolGroupRef.current = null;
+          }
+
+          if (engineRef.current) {
+              engineRef.current.destroy();
+              engineRef.current = null;
+          }
+
+          // Critical for 180MB files: completely purge cache and WebGL textures
+          cornerstone.cache.purgeCache();
+      };
+  }, []);
 
   return (
     <section className="mpr-grid" aria-label="Мультипланарная реконструкция">
