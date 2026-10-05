@@ -1,0 +1,17 @@
+--- src/App.tsx
++++ src/App.tsx
+@@ -107,6 +107,14 @@
+       }
+       return filtered;
+     });
++
++    // Clear volume from cache
++    import('@cornerstonejs/core').then((cornerstone) => {
++      const volumeId = `local:dicom-volume-${idToRemove}`;
++      if (cornerstone.cache.getVolume(volumeId)) {
++        cornerstone.cache.removeVolumeLoadObject(volumeId);
++      }
++    }).catch(console.error);
+   }, [activeStudyId]);
+
+   const handleReady = useCallback(() => setLoading(null), []);
