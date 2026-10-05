@@ -240,26 +240,35 @@ async function parseVolume(
   }
   const firstFrame = frameFunctionalGroup(dataSet, PER_FRAME_GROUPS_TAG, 0);
 
-  const rootSpacing = numbers(dataSet, 'x00280030');
-  const pixelSpacing = nestedValue(
+  let rootSpacing = numbers(dataSet, 'x00280030');
+  if (!rootSpacing || rootSpacing.length < 2) {
+    rootSpacing = numbers(dataSet, 'x00181164'); // Imager Pixel Spacing
+  }
+  if (!rootSpacing || rootSpacing.length < 2) {
+    rootSpacing = numbers(dataSet, 'x00182010'); // Nominal Scanned Pixel Spacing
+  }
+
+  let pixelSpacing = nestedValue(
     shared,
     shared,
     PIXEL_MEASURES_TAG,
     'x00280030',
   ) ?? nestedValue(firstFrame, shared, PIXEL_MEASURES_TAG, 'x00280030') ?? rootSpacing;
+
   if (!pixelSpacing || pixelSpacing.length < 2 || pixelSpacing[0] <= 0 || pixelSpacing[1] <= 0) {
-    throw new Error('В DICOM отсутствует корректный Pixel Spacing.');
+    pixelSpacing = [1.0, 1.0]; // Fallback for secondary captures
   }
 
   const rootOrientation = numbers(dataSet, 'x00200037');
-  const orientation = nestedValue(
+  let orientation = nestedValue(
     shared,
     shared,
     PLANE_ORIENTATION_TAG,
     'x00200037',
   ) ?? nestedValue(firstFrame, shared, PLANE_ORIENTATION_TAG, 'x00200037') ?? rootOrientation;
+
   if (!orientation || orientation.length < 6) {
-    throw new Error('В DICOM отсутствует Image Orientation Patient.');
+    orientation = [1, 0, 0, 0, 1, 0]; // Default axial orientation
   }
   const xAxis = orientation.slice(0, 3);
   const yAxis = orientation.slice(3, 6);
@@ -345,11 +354,11 @@ async function parseVolume(
     dataSet.string('x00180088') ??
     '0',
   );
-  const spacingZ = frameSpacing ??
+  let spacingZ = frameSpacing ??
     (Number.isFinite(declaredSpacing) && declaredSpacing > 0 ? declaredSpacing : undefined) ??
     sliceThickness;
   if (!Number.isFinite(spacingZ) || spacingZ <= 0) {
-    throw new Error('Не удалось определить положительный шаг между срезами.');
+    spacingZ = 1.0; // Fallback for single secondary capture images
   }
   if (frameDistances.some((distance) => Math.abs(distance - spacingZ) > Math.max(0.02, spacingZ * 0.02))) {
     throw new Error('Позиции кадров имеют неравномерный шаг; построение регулярного MPR-объема небезопасно.');
@@ -665,9 +674,9 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
   if (distances.some((distance) => distance <= 0.001)) {
     throw new Error('В серии есть срезы с совпадающими позициями; корректный MPR-объем построить нельзя.');
   }
-  const spacingZ = distances.length > 0 ? median(distances) : first.spacing[2];
+  let spacingZ = distances.length > 0 ? median(distances) : first.spacing[2];
   if (!Number.isFinite(spacingZ) || spacingZ <= 0) {
-    throw new Error('Не удалось определить положительный шаг между срезами серии.');
+    spacingZ = 1.0;
   }
   if (distances.some((distance) =>
     Math.abs(distance - spacingZ) > Math.max(0.02, spacingZ * 0.02))) {
