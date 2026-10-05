@@ -202,14 +202,15 @@ async function parseVolume(
   const highBit = requiredNumber(dataSet, 'x00280102', 'High Bit');
   const pixelRepresentation = dataSet.uint16('x00280103') ?? 0;
   const samplesPerPixel = dataSet.uint16('x00280002') ?? 1;
+  const planarConfiguration = dataSet.uint16('x00280006') ?? 0;
   const photometricInterpretation = dataSet.string('x00280004')?.trim() ?? '';
 
   if (!Number.isInteger(numberOfFrames) || numberOfFrames < 1 ||
       !Number.isInteger(rows) || rows < 1 || !Number.isInteger(columns) || columns < 1) {
     throw new Error('Некорректные размеры изображения или Number of Frames.');
   }
-  if (samplesPerPixel !== 1 || !photometricInterpretation.startsWith('MONOCHROME')) {
-    throw new Error('Поддерживаются только одноканальные томограммы MONOCHROME1/MONOCHROME2.');
+  if (![1, 3].includes(samplesPerPixel)) {
+    throw new Error(`Поддерживаются только томограммы с 1 или 3 каналами (получено ${samplesPerPixel}).`);
   }
   if (![8, 16].includes(bitsAllocated) || bitsStored > bitsAllocated ||
       bitsStored < 1 || highBit >= bitsAllocated || pixelRepresentation > 1) {
@@ -223,13 +224,13 @@ async function parseVolume(
 
   const voxelCount = rows * columns * numberOfFrames;
   const bytesPerPixel = bitsAllocated / 8;
-  const expectedPixelBytes = voxelCount * bytesPerPixel;
+  const expectedPixelBytes = voxelCount * bytesPerPixel * samplesPerPixel;
 
   if (!isCompressed && (!Number.isSafeInteger(voxelCount) ||
       (pixelElement.length !== expectedPixelBytes &&
         !(expectedPixelBytes % 2 === 1 && pixelElement.length === expectedPixelBytes + 1)) ||
       pixelElement.dataOffset + expectedPixelBytes > bytes.byteLength)) {
-    throw new Error('Размер Pixel Data не соответствует Rows × Columns × Number of Frames.');
+    throw new Error('Размер Pixel Data не соответствует Rows × Columns × Samples × Number of Frames.');
   }
 
   const shared = firstItem(dataSet, SHARED_GROUPS_TAG);
@@ -402,31 +403,53 @@ async function parseVolume(
 
       let framePixels: Uint8Array | Uint16Array | Int16Array;
       if (isLosslessJPEG) {
-        // Vite and rollup handling of CommonJS modules usually puts the default export in `default`,
-        // but TypeScript sometimes expects it directly. Check both.
         const decoder = new JpegLosslessDecoder();
         const decompressed = decoder.decode(compressedBytes.buffer, compressedBytes.byteOffset, compressedBytes.byteLength);
 
-        // JPEG Lossless decoder can return different ArrayBuffer views. Usually Int16/Uint16 or Uint8
         if (bitsAllocated === 8) {
-          framePixels = new Uint8Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+          const rawPixels = new Uint8Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame * samplesPerPixel);
+          if (samplesPerPixel === 3) {
+             framePixels = new Uint8Array(voxelsPerFrame);
+             for (let i = 0; i < voxelsPerFrame; i++) {
+                 // Convert RGB/YBR to Grayscale
+                 framePixels[i] = Math.round(rawPixels[i * 3] * 0.299 + rawPixels[i * 3 + 1] * 0.587 + rawPixels[i * 3 + 2] * 0.114);
+             }
+          } else {
+              framePixels = rawPixels;
+          }
         } else if (signed) {
-          framePixels = new Int16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+          const rawPixels = new Int16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame * samplesPerPixel);
+          if (samplesPerPixel === 3) {
+             framePixels = new Int16Array(voxelsPerFrame);
+             for (let i = 0; i < voxelsPerFrame; i++) {
+                 framePixels[i] = Math.round(rawPixels[i * 3] * 0.299 + rawPixels[i * 3 + 1] * 0.587 + rawPixels[i * 3 + 2] * 0.114);
+             }
+          } else {
+              framePixels = rawPixels;
+          }
         } else {
-          framePixels = new Uint16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+          const rawPixels = new Uint16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame * samplesPerPixel);
+          if (samplesPerPixel === 3) {
+             framePixels = new Uint16Array(voxelsPerFrame);
+             for (let i = 0; i < voxelsPerFrame; i++) {
+                 framePixels[i] = Math.round(rawPixels[i * 3] * 0.299 + rawPixels[i * 3 + 1] * 0.587 + rawPixels[i * 3 + 2] * 0.114);
+             }
+          } else {
+              framePixels = rawPixels;
+          }
         }
       } else {
-        // Baseline JPEG
-        const decoded = decodeJpegBaseline(compressedBytes, { useTArray: true, colorTransform: false });
-        // jpeg-js returns RGBA by default, we need to extract the single channel
+        // Baseline JPEG (jpeg-js always returns RGBA or raw samples depending on parameters)
+        // With colorTransform: true (default), it converts YCbCr to RGB. We let it do the default (RGBA output).
+        const decoded = decodeJpegBaseline(compressedBytes, { useTArray: true, formatAsRGBA: true });
         framePixels = new Uint8Array(voxelsPerFrame);
-        if (decoded.data.length === voxelsPerFrame) {
-          framePixels.set(decoded.data);
-        } else if (decoded.data.length === voxelsPerFrame * 4) {
-          // Extract R channel (assuming Grayscale stored in R or identical across RGB)
+        if (decoded.data.length === voxelsPerFrame * 4) {
           for (let i = 0; i < voxelsPerFrame; i++) {
-            framePixels[i] = decoded.data[i * 4];
+             // Convert RGBA to Grayscale
+             framePixels[i] = Math.round(decoded.data[i * 4] * 0.299 + decoded.data[i * 4 + 1] * 0.587 + decoded.data[i * 4 + 2] * 0.114);
           }
+        } else if (decoded.data.length === voxelsPerFrame) {
+            framePixels.set(decoded.data);
         } else {
           throw new Error('Неожиданный размер данных после JPEG распаковки.');
         }
@@ -449,15 +472,34 @@ async function parseVolume(
     for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
       const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
       const sourceFrame = descriptors[outputFrame].index;
-      const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel;
+      const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel * samplesPerPixel;
       const destinationOffset = outputFrame * voxelsPerFrame;
+
       for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
-        const raw = readPixelValue(
-          view,
-          sourceOffset + voxel * bytesPerPixel,
-          bitsAllocated,
-          littleEndian,
-        );
+        let raw: number;
+        if (samplesPerPixel === 3) {
+           let r: number, g: number, b: number;
+           if (planarConfiguration === 0) {
+             const offset = sourceOffset + voxel * bytesPerPixel * 3;
+             r = readPixelValue(view, offset, bitsAllocated, littleEndian);
+             g = readPixelValue(view, offset + bytesPerPixel, bitsAllocated, littleEndian);
+             b = readPixelValue(view, offset + bytesPerPixel * 2, bitsAllocated, littleEndian);
+           } else {
+             const frameSize = voxelsPerFrame * bytesPerPixel;
+             r = readPixelValue(view, sourceOffset + voxel * bytesPerPixel, bitsAllocated, littleEndian);
+             g = readPixelValue(view, sourceOffset + frameSize + voxel * bytesPerPixel, bitsAllocated, littleEndian);
+             b = readPixelValue(view, sourceOffset + frameSize * 2 + voxel * bytesPerPixel, bitsAllocated, littleEndian);
+           }
+           raw = Math.round(r * 0.299 + g * 0.587 + b * 0.114);
+        } else {
+           raw = readPixelValue(
+             view,
+             sourceOffset + voxel * bytesPerPixel,
+             bitsAllocated,
+             littleEndian,
+           );
+        }
+
         const storedValue = shift > 0 ? raw >>> shift : raw;
         const masked = storedValue & mask;
         const value = (pixelRepresentation === 1 && (masked & signBit) !== 0)
@@ -486,9 +528,9 @@ async function parseVolume(
   const frameMetadata: import('@cornerstonejs/core').Types.Metadata = {
     BitsAllocated: bitsAllocated,
     BitsStored: bitsStored,
-    SamplesPerPixel: samplesPerPixel,
+    SamplesPerPixel: 1, // We force 1 because we convert everything to Grayscale
     HighBit: highBit,
-    PhotometricInterpretation: photometricInterpretation,
+    PhotometricInterpretation: 'MONOCHROME2', // We force MONOCHROME2 because we output Grayscale
     PixelRepresentation: pixelRepresentation,
     Modality: dataSet.string('x00080060')?.trim() ?? 'CT',
     SeriesInstanceUID: dataSet.string('x0020000e')?.trim(),
