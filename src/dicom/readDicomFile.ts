@@ -60,7 +60,7 @@ export function readDicomFiles(
       if (settled) return;
       if (index === files.length) {
         onProgress({ loaded: totalSize, total: totalSize, stage: 'parsing' });
-        const defaultName = sourceNameFallback || (files.length === 1 ? files[0].name : `DICOM серия (${files.length} срезов)`);
+        const defaultName = files.length === 1 ? files[0].name : (sourceNameFallback || `DICOM серия (${files.length} срезов)`);
         worker.postMessage(
           {
             buffers,

@@ -8,7 +8,7 @@
   --surface: #101720;
   --line: #202b37;
   --muted: #7f8d9c;
-  --accent: #5bc4ff;
+  --accent: #61d8bb;
 }
 
 * {
@@ -36,14 +36,14 @@ button {
 }
 
 .app-shell--dragging {
-  background: rgba(91, 196, 255, 0.045);
+  background: rgba(97, 216, 187, 0.045);
 }
 
 .app-shell--dragging::after {
   content: '';
   position: fixed;
   inset: 12px;
-  border: 2px dashed rgba(91, 196, 255, 0.5);
+  border: 2px dashed rgba(97, 216, 187, 0.5);
   border-radius: 12px;
   pointer-events: none;
   z-index: 100;
@@ -71,9 +71,9 @@ button {
   align-items: center;
   justify-content: center;
   gap: 3px;
-  border: 1px solid rgba(91, 196, 255, 0.35);
+  border: 1px solid rgba(97, 216, 187, 0.35);
   border-radius: 10px;
-  background: rgba(91, 196, 255, 0.08);
+  background: rgba(97, 216, 187, 0.08);
 }
 
 .brand-mark span {
@@ -126,7 +126,7 @@ button {
 
 .status-indicator--ready {
   background: var(--accent);
-  box-shadow: 0 0 10px rgba(91, 196, 255, 0.65);
+  box-shadow: 0 0 10px rgba(97, 216, 187, 0.65);
 }
 
 .main-layout {
@@ -194,7 +194,7 @@ button {
 }
 
 .study-item--active {
-  background: rgba(91, 196, 255, 0.08);
+  background: rgba(97, 216, 187, 0.08);
   border-left: 3px solid var(--accent);
 }
 
@@ -253,28 +253,28 @@ button {
   width: 126px;
   height: 126px;
   margin: 0 auto 29px;
-  border: 1px solid rgba(91, 196, 255, 0.1);
+  border: 1px solid rgba(97, 216, 187, 0.1);
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(64, 136, 179, 0.12), rgba(91, 196, 255, 0.015) 70%);
+  background: radial-gradient(circle, rgba(71, 147, 143, 0.12), rgba(97, 216, 187, 0.015) 70%);
 }
 
 .scan-ring {
   position: absolute;
   inset: 50%;
-  border: 1px solid rgba(91, 196, 255, 0.4);
+  border: 1px solid rgba(97, 216, 187, 0.4);
   border-radius: 50%;
   transform: translate(-50%, -50%);
 }
 
 .scan-ring--outer { width: 86px; height: 86px; opacity: 0.35; }
 .scan-ring--middle { width: 60px; height: 60px; opacity: 0.6; }
-.scan-ring--inner { width: 30px; height: 30px; border-color: rgba(91, 196, 255, 0.65); }
+.scan-ring--inner { width: 30px; height: 30px; border-color: rgba(97, 216, 187, 0.65); }
 
 .scan-cross {
   position: absolute;
   top: 50%;
   left: 50%;
-  background: rgba(91, 196, 255, 0.42);
+  background: rgba(97, 216, 187, 0.42);
   transform: translate(-50%, -50%);
 }
 
@@ -289,12 +289,12 @@ button {
   height: 5px;
   border-radius: 50%;
   background: #9cf1d8;
-  box-shadow: 0 0 13px rgba(91, 196, 255, 0.8);
+  box-shadow: 0 0 13px rgba(97, 216, 187, 0.8);
   transform: translate(-50%, -50%);
 }
 
 .empty-state .eyebrow {
-  color: #68bdf2;
+  color: #70cbb3;
 }
 
 .empty-state h2 {
@@ -319,7 +319,7 @@ button {
   gap: 9px;
   margin-top: 23px;
   padding: 11px 18px;
-  border: 1px solid rgba(91, 196, 255, 0.5);
+  border: 1px solid rgba(97, 216, 187, 0.5);
   border-radius: 7px;
   color: #07120f;
   background: var(--accent);
@@ -331,7 +331,7 @@ button {
 }
 
 .primary-button:hover {
-  background: #89d6ff;
+  background: #82e8cf;
   transform: translateY(-1px);
 }
 
@@ -352,8 +352,8 @@ button {
 }
 
 .folder-button:hover {
-  border-color: #56a9db;
-  color: #a0dfff;
+  border-color: #5db59f;
+  color: #a1ead5;
 }
 
 .primary-button span {
@@ -372,7 +372,7 @@ button {
 }
 
 .privacy-note span {
-  color: #64b2e6;
+  color: #6bbfa9;
   font-size: 13px;
 }
 
@@ -402,10 +402,10 @@ button {
   height: 34px;
   flex: 0 0 auto;
   place-items: center;
-  border: 1px solid rgba(91, 196, 255, 0.18);
+  border: 1px solid rgba(97, 216, 187, 0.18);
   border-radius: 7px;
   color: var(--accent);
-  background: rgba(91, 196, 255, 0.07);
+  background: rgba(97, 216, 187, 0.07);
 }
 
 .study-title > div {
@@ -460,8 +460,8 @@ button {
 }
 
 .change-file-button:hover {
-  border-color: #56a9db;
-  color: #a0dfff;
+  border-color: #5db59f;
+  color: #a1ead5;
 }
 
 .mpr-grid {
@@ -597,7 +597,7 @@ kbd {
 }
 
 .loading-card .eyebrow {
-  color: #68bdf2;
+  color: #70cbb3;
   font-size: 8px;
 }
 
@@ -619,7 +619,7 @@ kbd {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #289ce0, #89d6ff);
+  background: linear-gradient(90deg, #42b99c, #8be8ce);
   transition: width 180ms ease;
 }
 
@@ -632,7 +632,7 @@ kbd {
 }
 
 .progress-caption strong {
-  color: #a0dcfa;
+  color: #a4e5d2;
   font-weight: 600;
 }
 

@@ -2,15 +2,6 @@ import type { Types } from '@cornerstonejs/core';
 
 export type ScalarVolumeData = Int16Array | Uint16Array | Uint8Array | Float32Array;
 
-export interface ViewportState {
-  camera?: Types.ICamera;
-  voi?: { windowWidth: number; windowCenter: number };
-}
-
-export interface VolumeSavedState {
-  viewports: Record<string, ViewportState>;
-}
-
 export interface ParsedDicomVolume {
   scalarData: ScalarVolumeData;
   metadata: Types.Metadata;
