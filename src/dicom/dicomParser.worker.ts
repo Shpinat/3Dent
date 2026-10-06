@@ -61,6 +61,21 @@ function readPixelValue(
   return view.getUint16(offset, littleEndian);
 }
 
+function normalizePixel(
+  value: number,
+  bitsStored: number,
+  highBit: number,
+  pixelRepresentation: number,
+): number {
+  const shift = highBit - bitsStored + 1;
+  const storedValue = shift > 0 ? value >>> shift : value;
+  const mask = 2 ** bitsStored - 1;
+  const masked = storedValue & mask;
+  if (pixelRepresentation === 1 && (masked & (2 ** (bitsStored - 1))) !== 0) {
+    return masked - 2 ** bitsStored;
+  }
+  return masked;
+}
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -83,80 +98,38 @@ function decodeString(dataSet: DataSet, tag: string): string | undefined {
   // Remove formatting caret delimiters (e.g. Last^First -> Last First)
   cleaned = cleaned.replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // Extract Specific Character Set (0008,0005)
-  // It can be a single string or multiple values separated by backslash
-  const charSetTag = dataSet.string('x00080005');
-  const charSets = charSetTag ? charSetTag.split('\\').map(s => s.trim()) : [];
-  const primaryCharSet = charSets[0] || '';
+  // 1. Try to read directly from raw bytes using windows-1251 decoder.
+  // This bypasses dicom-parser's internal string decoding which corrupts some Russian charsets.
+  try {
+    const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
+    const decoder1251 = new TextDecoder('windows-1251');
+    const decoded1251 = decoder1251.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // Determine encoding based on Specific Character Set
-  let encoding: string | undefined;
-  let force1251Fallback = false;
-
-  if (!primaryCharSet || primaryCharSet === 'ISO_IR 100') {
-    // Missing, empty, or default Latin. We use windows-1251 as fallback
-    // for medical images from CIS where Cyrillic is written over Latin.
-    force1251Fallback = true;
-    encoding = 'windows-1251';
-  } else if (primaryCharSet === 'ISO_IR 192') {
-    encoding = 'utf-8';
-  } else if (primaryCharSet === 'ISO_IR 144') {
-    encoding = 'iso-8859-5';
-  } else if (primaryCharSet === 'ISO_IR 126') {
-    encoding = 'iso-8859-7';
-  } else if (primaryCharSet === 'ISO_IR 127') {
-    encoding = 'iso-8859-8';
-  } else if (primaryCharSet === 'ISO_IR 138') {
-    encoding = 'iso-8859-9';
-  } else if (primaryCharSet === 'ISO_IR 148') {
-    encoding = 'iso-8859-9';
-  } else if (primaryCharSet === 'ISO_IR 13') {
-    encoding = 'shift-jis';
-  } else if (primaryCharSet === 'GB18030') {
-    encoding = 'gb18030';
-  }
-
-  // 1. Try to read directly from raw bytes using the determined encoding.
-  if (encoding) {
-    try {
-      const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
-      const decoder = new TextDecoder(encoding);
-      const decoded = decoder.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
-
-      // If we are forcing 1251 fallback, check if it actually looks like valid Cyrillic
-      if (force1251Fallback) {
-        if (/[А-Яа-я]/.test(decoded) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded)) {
-          return decoded;
-        }
-      } else {
-        // If it's explicitly specified encoding, trust it
-        return decoded;
-      }
-    } catch (error) {
-      // ignore byte reading errors, fallback below
+    // Check if the result looks like valid Cyrillic
+    if (/[А-Яа-я]/.test(decoded1251) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded1251)) {
+      return decoded1251;
     }
+  } catch (error) {
+    // ignore byte reading errors
   }
 
-  // 2. Fallback: If we forced 1251 and byte reading didn't work (or didn't look like Cyrillic),
-  // check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
-  if (force1251Fallback) {
-    const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
-    if (hasCyrillicMojiBake) {
-      try {
-        const bytes = new Uint8Array(cleaned.length);
-        for (let i = 0; i < cleaned.length; i++) {
-          bytes[i] = cleaned.charCodeAt(i) & 0xFF;
-        }
-
-        const decoder = new TextDecoder('windows-1251');
-        const decoded = decoder.decode(bytes);
-
-        if (/[А-Яа-я]/.test(decoded)) {
-          return decoded.trim();
-        }
-      } catch {
-        // Fallback to original
+  // 2. Fallback: Check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
+  const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
+  if (hasCyrillicMojiBake) {
+    try {
+      const bytes = new Uint8Array(cleaned.length);
+      for (let i = 0; i < cleaned.length; i++) {
+        bytes[i] = cleaned.charCodeAt(i) & 0xFF;
       }
+
+      const decoder = new TextDecoder('windows-1251');
+      const decoded = decoder.decode(bytes);
+
+      if (/[А-Яа-я]/.test(decoded)) {
+        return decoded.trim();
+      }
+    } catch {
+      // Fallback to original
     }
   }
 
@@ -202,15 +175,14 @@ async function parseVolume(
   const highBit = requiredNumber(dataSet, 'x00280102', 'High Bit');
   const pixelRepresentation = dataSet.uint16('x00280103') ?? 0;
   const samplesPerPixel = dataSet.uint16('x00280002') ?? 1;
-  const planarConfiguration = dataSet.uint16('x00280006') ?? 0;
   const photometricInterpretation = dataSet.string('x00280004')?.trim() ?? '';
 
   if (!Number.isInteger(numberOfFrames) || numberOfFrames < 1 ||
       !Number.isInteger(rows) || rows < 1 || !Number.isInteger(columns) || columns < 1) {
     throw new Error('Некорректные размеры изображения или Number of Frames.');
   }
-  if (![1, 3].includes(samplesPerPixel)) {
-    throw new Error(`Поддерживаются только томограммы с 1 или 3 каналами (получено ${samplesPerPixel}).`);
+  if (samplesPerPixel !== 1 || !photometricInterpretation.startsWith('MONOCHROME')) {
+    throw new Error('Поддерживаются только одноканальные томограммы MONOCHROME1/MONOCHROME2.');
   }
   if (![8, 16].includes(bitsAllocated) || bitsStored > bitsAllocated ||
       bitsStored < 1 || highBit >= bitsAllocated || pixelRepresentation > 1) {
@@ -224,13 +196,13 @@ async function parseVolume(
 
   const voxelCount = rows * columns * numberOfFrames;
   const bytesPerPixel = bitsAllocated / 8;
-  const expectedPixelBytes = voxelCount * bytesPerPixel * samplesPerPixel;
+  const expectedPixelBytes = voxelCount * bytesPerPixel;
 
   if (!isCompressed && (!Number.isSafeInteger(voxelCount) ||
       (pixelElement.length !== expectedPixelBytes &&
         !(expectedPixelBytes % 2 === 1 && pixelElement.length === expectedPixelBytes + 1)) ||
       pixelElement.dataOffset + expectedPixelBytes > bytes.byteLength)) {
-    throw new Error('Размер Pixel Data не соответствует Rows × Columns × Samples × Number of Frames.');
+    throw new Error('Размер Pixel Data не соответствует Rows × Columns × Number of Frames.');
   }
 
   const shared = firstItem(dataSet, SHARED_GROUPS_TAG);
@@ -379,11 +351,6 @@ async function parseVolume(
   const view = new DataView(buffer);
   const voxelsPerFrame = rows * columns;
 
-  const shift = highBit - bitsStored + 1;
-  const mask = 2 ** bitsStored - 1;
-  const signBit = 1 << (bitsStored - 1);
-  const signMask = 1 << bitsStored;
-
   if (isCompressed && pixelElement.encapsulatedPixelData) {
     const fragments = pixelElement.fragments?.filter(f => f.length > 0) || [];
 
@@ -403,53 +370,31 @@ async function parseVolume(
 
       let framePixels: Uint8Array | Uint16Array | Int16Array;
       if (isLosslessJPEG) {
+        // Vite and rollup handling of CommonJS modules usually puts the default export in `default`,
+        // but TypeScript sometimes expects it directly. Check both.
         const decoder = new JpegLosslessDecoder();
         const decompressed = decoder.decode(compressedBytes.buffer, compressedBytes.byteOffset, compressedBytes.byteLength);
 
+        // JPEG Lossless decoder can return different ArrayBuffer views. Usually Int16/Uint16 or Uint8
         if (bitsAllocated === 8) {
-          const rawPixels = new Uint8Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame * samplesPerPixel);
-          if (samplesPerPixel === 3) {
-             framePixels = new Uint8Array(voxelsPerFrame);
-             for (let i = 0; i < voxelsPerFrame; i++) {
-                 // Convert RGB/YBR to Grayscale
-                 framePixels[i] = Math.round(rawPixels[i * 3] * 0.299 + rawPixels[i * 3 + 1] * 0.587 + rawPixels[i * 3 + 2] * 0.114);
-             }
-          } else {
-              framePixels = rawPixels;
-          }
+          framePixels = new Uint8Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
         } else if (signed) {
-          const rawPixels = new Int16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame * samplesPerPixel);
-          if (samplesPerPixel === 3) {
-             framePixels = new Int16Array(voxelsPerFrame);
-             for (let i = 0; i < voxelsPerFrame; i++) {
-                 framePixels[i] = Math.round(rawPixels[i * 3] * 0.299 + rawPixels[i * 3 + 1] * 0.587 + rawPixels[i * 3 + 2] * 0.114);
-             }
-          } else {
-              framePixels = rawPixels;
-          }
+          framePixels = new Int16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
         } else {
-          const rawPixels = new Uint16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame * samplesPerPixel);
-          if (samplesPerPixel === 3) {
-             framePixels = new Uint16Array(voxelsPerFrame);
-             for (let i = 0; i < voxelsPerFrame; i++) {
-                 framePixels[i] = Math.round(rawPixels[i * 3] * 0.299 + rawPixels[i * 3 + 1] * 0.587 + rawPixels[i * 3 + 2] * 0.114);
-             }
-          } else {
-              framePixels = rawPixels;
-          }
+          framePixels = new Uint16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
         }
       } else {
-        // Baseline JPEG (jpeg-js always returns RGBA or raw samples depending on parameters)
-        // With colorTransform: true (default), it converts YCbCr to RGB. We let it do the default (RGBA output).
-        const decoded = decodeJpegBaseline(compressedBytes, { useTArray: true, formatAsRGBA: true });
+        // Baseline JPEG
+        const decoded = decodeJpegBaseline(compressedBytes, { useTArray: true, colorTransform: false });
+        // jpeg-js returns RGBA by default, we need to extract the single channel
         framePixels = new Uint8Array(voxelsPerFrame);
-        if (decoded.data.length === voxelsPerFrame * 4) {
+        if (decoded.data.length === voxelsPerFrame) {
+          framePixels.set(decoded.data);
+        } else if (decoded.data.length === voxelsPerFrame * 4) {
+          // Extract R channel (assuming Grayscale stored in R or identical across RGB)
           for (let i = 0; i < voxelsPerFrame; i++) {
-             // Convert RGBA to Grayscale
-             framePixels[i] = Math.round(decoded.data[i * 4] * 0.299 + decoded.data[i * 4 + 1] * 0.587 + decoded.data[i * 4 + 2] * 0.114);
+            framePixels[i] = decoded.data[i * 4];
           }
-        } else if (decoded.data.length === voxelsPerFrame) {
-            framePixels.set(decoded.data);
         } else {
           throw new Error('Неожиданный размер данных после JPEG распаковки.');
         }
@@ -457,12 +402,7 @@ async function parseVolume(
 
       for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
         const raw = framePixels[voxel];
-        const storedValue = shift > 0 ? raw >>> shift : raw;
-        const masked = storedValue & mask;
-        const value = (pixelRepresentation === 1 && (masked & signBit) !== 0)
-          ? masked - signMask
-          : masked;
-
+        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
         scalarData[destinationOffset + voxel] = requiresRescale
           ? value * slope + intercept
           : value;
@@ -472,40 +412,16 @@ async function parseVolume(
     for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
       const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
       const sourceFrame = descriptors[outputFrame].index;
-      const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel * samplesPerPixel;
+      const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel;
       const destinationOffset = outputFrame * voxelsPerFrame;
-
       for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
-        let raw: number;
-        if (samplesPerPixel === 3) {
-           let r: number, g: number, b: number;
-           if (planarConfiguration === 0) {
-             const offset = sourceOffset + voxel * bytesPerPixel * 3;
-             r = readPixelValue(view, offset, bitsAllocated, littleEndian);
-             g = readPixelValue(view, offset + bytesPerPixel, bitsAllocated, littleEndian);
-             b = readPixelValue(view, offset + bytesPerPixel * 2, bitsAllocated, littleEndian);
-           } else {
-             const frameSize = voxelsPerFrame * bytesPerPixel;
-             r = readPixelValue(view, sourceOffset + voxel * bytesPerPixel, bitsAllocated, littleEndian);
-             g = readPixelValue(view, sourceOffset + frameSize + voxel * bytesPerPixel, bitsAllocated, littleEndian);
-             b = readPixelValue(view, sourceOffset + frameSize * 2 + voxel * bytesPerPixel, bitsAllocated, littleEndian);
-           }
-           raw = Math.round(r * 0.299 + g * 0.587 + b * 0.114);
-        } else {
-           raw = readPixelValue(
-             view,
-             sourceOffset + voxel * bytesPerPixel,
-             bitsAllocated,
-             littleEndian,
-           );
-        }
-
-        const storedValue = shift > 0 ? raw >>> shift : raw;
-        const masked = storedValue & mask;
-        const value = (pixelRepresentation === 1 && (masked & signBit) !== 0)
-          ? masked - signMask
-          : masked;
-
+        const raw = readPixelValue(
+          view,
+          sourceOffset + voxel * bytesPerPixel,
+          bitsAllocated,
+          littleEndian,
+        );
+        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
         scalarData[destinationOffset + voxel] = requiresRescale
           ? value * slope + intercept
           : value;
@@ -528,9 +444,9 @@ async function parseVolume(
   const frameMetadata: import('@cornerstonejs/core').Types.Metadata = {
     BitsAllocated: bitsAllocated,
     BitsStored: bitsStored,
-    SamplesPerPixel: 1, // We force 1 because we convert everything to Grayscale
+    SamplesPerPixel: samplesPerPixel,
     HighBit: highBit,
-    PhotometricInterpretation: 'MONOCHROME2', // We force MONOCHROME2 because we output Grayscale
+    PhotometricInterpretation: photometricInterpretation,
     PixelRepresentation: pixelRepresentation,
     Modality: dataSet.string('x00080060')?.trim() ?? 'CT',
     SeriesInstanceUID: dataSet.string('x0020000e')?.trim(),
@@ -621,23 +537,16 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
     'PixelSpacing',
     'ImageOrientationPatient',
   ] as const;
-  const firstValues = requiredMetadata.map(key => first.metadata[key]);
-  for (let v = 1; v < volumes.length; v++) {
-    const volume = volumes[v];
-    for (let i = 0; i < requiredMetadata.length; i++) {
-      const key = requiredMetadata[i];
-      const firstValue = firstValues[i];
+  for (const volume of volumes.slice(1)) {
+    for (const key of requiredMetadata) {
+      const firstValue = first.metadata[key];
       const nextValue = volume.metadata[key];
       if (Array.isArray(firstValue) && Array.isArray(nextValue)) {
-        if (firstValue.length !== nextValue.length) {
+        if (firstValue.length !== nextValue.length ||
+            firstValue.some((value, index) =>
+              typeof value !== 'number' || typeof nextValue[index] !== 'number' ||
+              Math.abs(value - nextValue[index]!) > 0.0001)) {
           throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
-        }
-        for (let j = 0; j < firstValue.length; j++) {
-          const value = firstValue[j];
-          if (typeof value !== 'number' || typeof nextValue[j] !== 'number' ||
-              Math.abs(value - nextValue[j]!) > 0.0001) {
-            throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
-          }
         }
       } else if (firstValue !== nextValue) {
         throw new Error('В папке найдены разные DICOM-серии. Перетащите папку только с одной серией срезов.');

@@ -1,6 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useRef, useState } from 'react';
 import { readDicomFiles, type ReadProgress } from './dicom/readDicomFile';
-import type { ParsedDicomVolume, VolumeSavedState } from './dicom/types';
+import type { ParsedDicomVolume } from './dicom/types';
 
 const MprViewer = lazy(() =>
   import('./components/MprViewer').then((module) => ({ default: module.MprViewer })),
@@ -32,27 +32,15 @@ async function getFilesFromEntry(entry: FileSystemEntry): Promise<File[]> {
   return files.flat();
 }
 
-async function getDroppedFilesInfo(dataTransfer: DataTransfer): Promise<{ files: File[], droppedFolderName?: string }> {
+async function getDroppedFiles(dataTransfer: DataTransfer): Promise<File[]> {
   const entries = Array.from(dataTransfer.items)
     .map((item) => (item as DataTransferItem & {
       webkitGetAsEntry?: () => FileSystemEntry | null;
     }).webkitGetAsEntry?.())
     .filter((entry): entry is FileSystemEntry => entry !== null && entry !== undefined);
-
-  let droppedFolderName: string | undefined;
-  if (entries.length > 0) {
-    const firstDir = entries.find(e => e.isDirectory);
-    if (firstDir) {
-      droppedFolderName = firstDir.name;
-    }
-  }
-
-  if (entries.length === 0) {
-    return { files: Array.from(dataTransfer.files) };
-  }
-
+  if (entries.length === 0) return Array.from(dataTransfer.files);
   const files = await Promise.all(entries.map(getFilesFromEntry));
-  return { files: files.flat(), droppedFolderName };
+  return files.flat();
 }
 
 async function hasDicomSignature(file: File): Promise<boolean> {
@@ -67,25 +55,13 @@ async function hasDicomSignature(file: File): Promise<boolean> {
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const [studies, setStudies] = useState<{ id: string, volume: ParsedDicomVolume, savedState?: VolumeSavedState }[]>([]);
+  const [studies, setStudies] = useState<{ id: string, volume: ParsedDicomVolume }[]>([]);
   const [activeStudyId, setActiveStudyId] = useState<string | null>(null);
   const [loading, setLoading] = useState<LoadingState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [memoryUsed, setMemoryUsed] = useState<number | null>(null);
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if ((performance as any).memory) {
-        setMemoryUsed(Math.round((performance as any).memory.usedJSHeapSize / 1024 / 1024));
-      }
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, []);
-
-  const activeStudy = studies.find(s => s.id === activeStudyId);
-  const activeVolume = activeStudy?.volume || null;
+  const activeVolume = studies.find(s => s.id === activeStudyId)?.volume || null;
 
   const handleProgress = useCallback((progress: ReadProgress) => {
     if (progress.stage === 'parsing') {
@@ -98,7 +74,7 @@ export default function App() {
     setLoading({ message: 'Чтение файла с диска…', progress: percentage });
   }, []);
 
-  const loadFiles = useCallback(async (files: File[], droppedFolderName?: string) => {
+  const loadFiles = useCallback(async (files: File[]) => {
     if (files.length === 0) {
       setError('Папка не содержит файлов для загрузки.');
       setLoading(null);
@@ -108,11 +84,18 @@ export default function App() {
     setLoading({ message: 'Подготовка чтения…', progress: 0 });
     try {
       let dicomFiles = files;
-      let sourceNameFallback = droppedFolderName;
+      let sourceNameFallback = undefined;
 
-      if (!sourceNameFallback) {
-        // Try to extract the folder name from webkitRelativePath if not provided by drag and drop
-        const path = files[0]?.webkitRelativePath;
+      if (files.length > 1) {
+        dicomFiles = [];
+        for (const file of files) {
+          if (await hasDicomSignature(file)) dicomFiles.push(file);
+        }
+        if (dicomFiles.length === 0) {
+          throw new Error('В выбранной папке не найдены файлы DICOM с сигнатурой DICM.');
+        }
+
+        const path = files[0].webkitRelativePath;
         if (path) {
           const folderName = path.split('/')[0];
           if (folderName) {
@@ -120,15 +103,6 @@ export default function App() {
           }
         }
       }
-
-      if (files.length > 1) {
-        const signatureChecks = await Promise.all(files.map(file => hasDicomSignature(file)));
-        dicomFiles = files.filter((_, index) => signatureChecks[index]);
-        if (dicomFiles.length === 0) {
-          throw new Error('В выбранной папке не найдены файлы DICOM с сигнатурой DICM.');
-        }
-      }
-
       const parsedVolume = await readDicomFiles(dicomFiles, handleProgress, sourceNameFallback);
       const newStudyId = crypto.randomUUID();
       setStudies(prev => [...prev, { id: newStudyId, volume: parsedVolume }]);
@@ -147,14 +121,6 @@ export default function App() {
       }
       return filtered;
     });
-
-    // Clear volume from cache
-    import('@cornerstonejs/core').then((cornerstone) => {
-      const volumeId = `local:dicom-volume-${idToRemove}`;
-      if (cornerstone.cache.getVolume(volumeId)) {
-        cornerstone.cache.removeVolumeLoadObject(volumeId);
-      }
-    }).catch(console.error);
   }, [activeStudyId]);
 
   const handleReady = useCallback(() => setLoading(null), []);
@@ -167,20 +133,12 @@ export default function App() {
     if (activeStudyId) removeStudy(activeStudyId);
   }, [activeStudyId, removeStudy]);
 
-  const handleSaveState = useCallback((state: VolumeSavedState) => {
-    if (!activeStudyId) return;
-    setStudies(prev => prev.map(study =>
-      study.id === activeStudyId ? { ...study, savedState: state } : study
-    ));
-  }, [activeStudyId]);
-
   const handleDrop = async (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
     setDragging(false);
     setLoading({ message: 'Чтение содержимого папки…', progress: 0 });
     try {
-      const { files, droppedFolderName } = await getDroppedFilesInfo(event.dataTransfer);
-      await loadFiles(files, droppedFolderName);
+      await loadFiles(await getDroppedFiles(event.dataTransfer));
     } catch (dropError) {
       setError(dropError instanceof Error ? dropError.message : 'Не удалось прочитать папку.');
       setLoading(null);
@@ -217,11 +175,6 @@ export default function App() {
         </div>
         <div className="header-status">
           <span className={`status-indicator${studies.length > 0 ? ' status-indicator--ready' : ''}`} />
-          {memoryUsed !== null && (
-            <span style={{ marginRight: '8px', color: '#8291a1', fontSize: '11px' }}>
-              RAM: {memoryUsed} MB
-            </span>
-          )}
           {studies.length > 0 ? 'Локальный просмотр' : 'Ожидание файла'}
         </div>
       </header>
@@ -253,8 +206,8 @@ export default function App() {
                       {study.volume.studyDate && `${study.volume.studyDate} · `}
                       {study.volume.modality}
                     </span>
-                    <span className="study-item-desc" title={study.volume.sourceName}>
-                      {study.volume.sourceName}
+                    <span className="study-item-desc" title={study.volume.studyDescription || study.volume.seriesDescription || study.volume.sourceName}>
+                      {study.volume.studyDescription || study.volume.seriesDescription || study.volume.sourceName}
                     </span>
                   </div>
                   <button
@@ -292,10 +245,7 @@ export default function App() {
               </div>
               <Suspense fallback={null}>
                 <MprViewer
-                  studyId={activeStudyId!}
                   volume={activeVolume}
-                  savedState={activeStudy?.savedState}
-                  onSaveState={handleSaveState}
                   onStatus={handleViewerStatus}
                   onReady={handleReady}
                   onError={handleViewerError}
