@@ -136,11 +136,37 @@ function decodeString(dataSet: DataSet, tag: string): string | undefined {
   return cleaned;
 }
 
-async function parseVolume(
+interface ParsedFrameInfo {
+  buffer: ArrayBuffer;
+  dataSet: DataSet;
+  isCompressed: boolean;
+  isLosslessJPEG: boolean;
+  littleEndian: boolean;
+  requiresRescale: boolean;
+  slope: number;
+  intercept: number;
+  bitsAllocated: number;
+  bitsStored: number;
+  highBit: number;
+  pixelRepresentation: number;
+  signed: boolean;
+  pixelElement: Element;
+  projection: number;
+  rows: number;
+  columns: number;
+  bytesPerPixel: number;
+  numberOfFrames: number;
+  sourceFrameIndex: number; // for multiframe
+  origin: [number, number, number];
+  volumeInfo: any;
+}
+
+// Extract metadata and prepare for decoding
+function extractVolumeInfo(
   buffer: ArrayBuffer,
   sourceName: string,
   parsedDataSet?: DataSet,
-): Promise<SerializedDicomVolume> {
+): ParsedFrameInfo[] {
   const bytes = new Uint8Array(buffer);
   if (bytes.byteLength < 132 || bytes[128] !== 0x44 || bytes[129] !== 0x49 ||
       bytes[130] !== 0x43 || bytes[131] !== 0x4d) {
@@ -327,107 +353,7 @@ async function parseVolume(
     throw new Error('Позиции кадров имеют неравномерный шаг; построение регулярного MPR-объема небезопасно.');
   }
 
-  const firstPosition = descriptors[0].position ?? rootPosition ?? [0, 0, 0];
   const signed = pixelRepresentation === 1;
-  const frameRescales = Array.from({ length: numberOfFrames }, (_, index) => {
-    const frame = frameFunctionalGroup(dataSet, PER_FRAME_GROUPS_TAG, index);
-    const transform = firstItem(frame, PIXEL_VALUE_TRANSFORM_TAG) ??
-      firstItem(shared, PIXEL_VALUE_TRANSFORM_TAG);
-    const slope = Number.parseFloat(transform?.string('x00281053') ?? dataSet.string('x00281053') ?? '1');
-    const intercept = Number.parseFloat(transform?.string('x00281052') ?? dataSet.string('x00281052') ?? '0');
-    if (!Number.isFinite(slope) || !Number.isFinite(intercept)) {
-      throw new Error('Некорректные Rescale Slope/Intercept.');
-    }
-    return { slope, intercept };
-  });
-  const requiresRescale = frameRescales.some(({ slope, intercept }) => slope !== 1 || intercept !== 0);
-  const scalarData = requiresRescale
-    ? new Float32Array(voxelCount)
-    : bitsAllocated === 8 && !signed
-      ? new Uint8Array(voxelCount)
-      : signed
-        ? new Int16Array(voxelCount)
-        : new Uint16Array(voxelCount);
-  const view = new DataView(buffer);
-  const voxelsPerFrame = rows * columns;
-
-  if (isCompressed && pixelElement.encapsulatedPixelData) {
-    const fragments = pixelElement.fragments?.filter(f => f.length > 0) || [];
-
-    // Decompress frames
-    for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
-      const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
-      const sourceFrame = descriptors[outputFrame].index;
-
-      // We assume 1 fragment per frame. If multi-fragment per frame, this logic needs improvement.
-      if (sourceFrame >= fragments.length) {
-        throw new Error(`Недостаточно фрагментов сжатых данных. Кадр: ${sourceFrame}, Фрагментов: ${fragments.length}`);
-      }
-
-      const fragment = fragments[sourceFrame];
-      const compressedBytes = new Uint8Array(buffer, pixelElement.dataOffset + fragment.offset, fragment.length);
-      const destinationOffset = outputFrame * voxelsPerFrame;
-
-      let framePixels: Uint8Array | Uint16Array | Int16Array;
-      if (isLosslessJPEG) {
-        // Vite and rollup handling of CommonJS modules usually puts the default export in `default`,
-        // but TypeScript sometimes expects it directly. Check both.
-        const decoder = new JpegLosslessDecoder();
-        const decompressed = decoder.decode(compressedBytes.buffer, compressedBytes.byteOffset, compressedBytes.byteLength);
-
-        // JPEG Lossless decoder can return different ArrayBuffer views. Usually Int16/Uint16 or Uint8
-        if (bitsAllocated === 8) {
-          framePixels = new Uint8Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
-        } else if (signed) {
-          framePixels = new Int16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
-        } else {
-          framePixels = new Uint16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
-        }
-      } else {
-        // Baseline JPEG
-        const decoded = decodeJpegBaseline(compressedBytes, { useTArray: true, colorTransform: false });
-        // jpeg-js returns RGBA by default, we need to extract the single channel
-        framePixels = new Uint8Array(voxelsPerFrame);
-        if (decoded.data.length === voxelsPerFrame) {
-          framePixels.set(decoded.data);
-        } else if (decoded.data.length === voxelsPerFrame * 4) {
-          // Extract R channel (assuming Grayscale stored in R or identical across RGB)
-          for (let i = 0; i < voxelsPerFrame; i++) {
-            framePixels[i] = decoded.data[i * 4];
-          }
-        } else {
-          throw new Error('Неожиданный размер данных после JPEG распаковки.');
-        }
-      }
-
-      for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
-        const raw = framePixels[voxel];
-        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
-        scalarData[destinationOffset + voxel] = requiresRescale
-          ? value * slope + intercept
-          : value;
-      }
-    }
-  } else {
-    for (let outputFrame = 0; outputFrame < numberOfFrames; outputFrame++) {
-      const { slope, intercept } = frameRescales[descriptors[outputFrame].index];
-      const sourceFrame = descriptors[outputFrame].index;
-      const sourceOffset = pixelElement.dataOffset + sourceFrame * voxelsPerFrame * bytesPerPixel;
-      const destinationOffset = outputFrame * voxelsPerFrame;
-      for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
-        const raw = readPixelValue(
-          view,
-          sourceOffset + voxel * bytesPerPixel,
-          bitsAllocated,
-          littleEndian,
-        );
-        const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
-        scalarData[destinationOffset + voxel] = requiresRescale
-          ? value * slope + intercept
-          : value;
-      }
-    }
-  }
 
   const frameOfReferenceUID = dataSet.string('x00200052')?.trim();
   if (!frameOfReferenceUID) {
@@ -469,24 +395,11 @@ async function parseVolume(
   const seriesDescription = decodeString(dataSet, 'x0008103e');
   const manufacturer = decodeString(dataSet, 'x00080070');
 
-  return {
-    scalarData: scalarData.buffer,
-    scalarType: scalarData instanceof Int16Array
-      ? 'Int16Array'
-      : scalarData instanceof Uint16Array
-        ? 'Uint16Array'
-        : scalarData instanceof Uint8Array
-          ? 'Uint8Array'
-          : 'Float32Array',
+  const volumeInfo = {
     metadata: frameMetadata,
     dimensions: [columns, rows, numberOfFrames],
     spacing: [pixelSpacing[1], pixelSpacing[0], spacingZ],
-    origin: firstPosition.slice(0, 3) as [number, number, number],
-    direction: new Float32Array([
-      ...xAxis,
-      ...yAxis,
-      ...normal,
-    ]),
+    direction: new Float32Array([...xAxis, ...yAxis, ...normal]),
     sliceThickness: Number.isFinite(sliceThickness) && sliceThickness > 0 ? sliceThickness : spacingZ,
     numberOfFrames,
     windowCenter: Number.isFinite(windowCenter) ? windowCenter : 40,
@@ -501,27 +414,137 @@ async function parseVolume(
     seriesDescription,
     manufacturer,
   };
+
+  return descriptors.map((desc) => {
+    const frame = frameFunctionalGroup(dataSet, PER_FRAME_GROUPS_TAG, desc.index);
+    const transform = firstItem(frame, PIXEL_VALUE_TRANSFORM_TAG) ??
+      firstItem(shared, PIXEL_VALUE_TRANSFORM_TAG);
+    const slope = Number.parseFloat(transform?.string('x00281053') ?? dataSet.string('x00281053') ?? '1');
+    const intercept = Number.parseFloat(transform?.string('x00281052') ?? dataSet.string('x00281052') ?? '0');
+    if (!Number.isFinite(slope) || !Number.isFinite(intercept)) {
+      throw new Error('Некорректные Rescale Slope/Intercept.');
+    }
+
+    return {
+      buffer,
+      dataSet,
+      isCompressed,
+      isLosslessJPEG,
+      littleEndian,
+      requiresRescale: slope !== 1 || intercept !== 0,
+      slope,
+      intercept,
+      bitsAllocated,
+      bitsStored,
+      highBit,
+      pixelRepresentation,
+      signed,
+      pixelElement,
+      projection: desc.projection ?? 0,
+      rows,
+      columns,
+      bytesPerPixel,
+      numberOfFrames,
+      sourceFrameIndex: desc.index,
+      origin: (desc.position ?? rootPosition ?? [0, 0, 0]).slice(0, 3) as [number, number, number],
+      volumeInfo,
+    };
+  });
 }
 
-function scalarArray(volume: SerializedDicomVolume): Uint8Array | Uint16Array | Int16Array | Float32Array {
-  switch (volume.scalarType) {
-    case 'Uint8Array':
-      return new Uint8Array(volume.scalarData);
-    case 'Uint16Array':
-      return new Uint16Array(volume.scalarData);
-    case 'Int16Array':
-      return new Int16Array(volume.scalarData);
-    case 'Float32Array':
-      return new Float32Array(volume.scalarData);
+function decodeFrame(frame: ParsedFrameInfo, scalarData: Float32Array | Uint8Array | Uint16Array | Int16Array, outputFrameIndex: number) {
+  const {
+    buffer, isCompressed, isLosslessJPEG, littleEndian, requiresRescale, slope, intercept,
+    bitsAllocated, bitsStored, highBit, pixelRepresentation, signed, pixelElement,
+    rows, columns, bytesPerPixel, sourceFrameIndex,
+  } = frame;
+
+  const view = new DataView(buffer);
+  const voxelsPerFrame = rows * columns;
+  const destinationOffset = outputFrameIndex * voxelsPerFrame;
+
+  if (isCompressed && pixelElement.encapsulatedPixelData) {
+    const fragments = pixelElement.fragments?.filter(f => f.length > 0) || [];
+    if (sourceFrameIndex >= fragments.length) {
+      throw new Error(`Недостаточно фрагментов сжатых данных. Кадр: ${sourceFrameIndex}, Фрагментов: ${fragments.length}`);
+    }
+
+    const fragment = fragments[sourceFrameIndex];
+    const compressedBytes = new Uint8Array(buffer, pixelElement.dataOffset + fragment.offset, fragment.length);
+
+    let framePixels: Uint8Array | Uint16Array | Int16Array;
+    if (isLosslessJPEG) {
+      const decoder = new JpegLosslessDecoder();
+      const decompressed = decoder.decode(compressedBytes.buffer, compressedBytes.byteOffset, compressedBytes.byteLength);
+      if (bitsAllocated === 8) {
+        framePixels = new Uint8Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+      } else if (signed) {
+        framePixels = new Int16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+      } else {
+        framePixels = new Uint16Array(decompressed.buffer, decompressed.byteOffset, voxelsPerFrame);
+      }
+    } else {
+      const decoded = decodeJpegBaseline(compressedBytes, { useTArray: true, colorTransform: false });
+      framePixels = new Uint8Array(voxelsPerFrame);
+      if (decoded.data.length === voxelsPerFrame) {
+        framePixels.set(decoded.data);
+      } else if (decoded.data.length === voxelsPerFrame * 4) {
+        for (let i = 0; i < voxelsPerFrame; i++) {
+          framePixels[i] = decoded.data[i * 4];
+        }
+      } else {
+        throw new Error('Неожиданный размер данных после JPEG распаковки.');
+      }
+    }
+
+    for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
+      const raw = framePixels[voxel];
+      const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
+      scalarData[destinationOffset + voxel] = requiresRescale ? value * slope + intercept : value;
+    }
+  } else {
+    const sourceOffset = pixelElement.dataOffset + sourceFrameIndex * voxelsPerFrame * bytesPerPixel;
+    for (let voxel = 0; voxel < voxelsPerFrame; voxel++) {
+      const raw = readPixelValue(view, sourceOffset + voxel * bytesPerPixel, bitsAllocated, littleEndian);
+      const value = normalizePixel(raw, bitsStored, highBit, pixelRepresentation);
+      scalarData[destinationOffset + voxel] = requiresRescale ? value * slope + intercept : value;
+    }
   }
 }
 
-function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): SerializedDicomVolume {
-  if (volumes.some((volume) => volume.numberOfFrames !== 1)) {
-    throw new Error('Для папки выберите либо один multi-frame DICOM, либо серию отдельных одно-кадровых срезов.');
+async function parseFiles(buffers: ArrayBuffer[], sourceName: string): Promise<SerializedDicomVolume> {
+  if (buffers.length === 0) {
+    throw new Error('Не найдены DICOM-файлы для загрузки.');
   }
 
-  const first = volumes[0];
+  const allFrames: ParsedFrameInfo[] = [];
+
+  // Pass 1: Extract metadata from all files and buffers
+  for (let i = 0; i < buffers.length; i++) {
+    const buffer = buffers[i];
+    const bytes = new Uint8Array(buffer);
+    if (bytes.byteLength < 132 || bytes[128] !== 0x44 || bytes[129] !== 0x49 ||
+        bytes[130] !== 0x43 || bytes[131] !== 0x4d) {
+      if (buffers.length === 1) {
+        throw new Error('Файл не содержит сигнатуру DICM в позиции 128 и не распознан как Part 10 DICOM.');
+      }
+      continue; // Skip invalid files in a folder
+    }
+
+    const dataSet = parseDicom(bytes);
+    if (dataSet.string(MEDIA_STORAGE_SOP_CLASS_TAG)?.trim() === DICOM_DIRECTORY_STORAGE_UID) {
+      continue;
+    }
+
+    const framesInfo = extractVolumeInfo(buffer, sourceName, dataSet);
+    allFrames.push(...framesInfo);
+  }
+
+  if (allFrames.length === 0) {
+    throw new Error('Не найдено корректных файлов изображений.');
+  }
+
+  const firstFrame = allFrames[0];
   const requiredMetadata = [
     'SeriesInstanceUID',
     'FrameOfReferenceUID',
@@ -537,115 +560,107 @@ function combineSlices(volumes: SerializedDicomVolume[], sourceName: string): Se
     'PixelSpacing',
     'ImageOrientationPatient',
   ] as const;
-  for (const volume of volumes.slice(1)) {
+
+  // Validate consistency across all frames
+  for (const frame of allFrames) {
     for (const key of requiredMetadata) {
-      const firstValue = first.metadata[key];
-      const nextValue = volume.metadata[key];
+      const firstValue = firstFrame.volumeInfo.metadata[key];
+      const nextValue = frame.volumeInfo.metadata[key];
       if (Array.isArray(firstValue) && Array.isArray(nextValue)) {
         if (firstValue.length !== nextValue.length ||
             firstValue.some((value, index) =>
               typeof value !== 'number' || typeof nextValue[index] !== 'number' ||
               Math.abs(value - nextValue[index]!) > 0.0001)) {
-          throw new Error('В папке найдены DICOM-файлы с разными геометрией или параметрами пикселей. Нужна одна серия срезов.');
+          throw new Error('Найдены кадры/файлы с разными геометрией или параметрами пикселей.');
         }
       } else if (firstValue !== nextValue) {
-        throw new Error('В папке найдены разные DICOM-серии. Перетащите папку только с одной серией срезов.');
+        throw new Error('В папке найдены разные DICOM-серии. Выберите только одну серию.');
       }
     }
-    if (volume.dimensions[0] !== first.dimensions[0] ||
-        volume.dimensions[1] !== first.dimensions[1]) {
-      throw new Error('Размеры изображений в серии различаются; построить единый MPR-объем нельзя.');
+  }
+
+  // Sort all frames by projection
+  allFrames.sort((a, b) => a.projection - b.projection);
+
+  // Recalculate spacing Z if there are multiple frames
+  let spacingZ = firstFrame.volumeInfo.spacing[2];
+  if (allFrames.length > 1) {
+    const distances = allFrames.slice(1).map((item, index) => item.projection - allFrames[index].projection);
+    if (distances.some((distance) => distance <= 0.001)) {
+      throw new Error('В серии есть срезы с совпадающими позициями; корректный MPR-объем построить нельзя.');
+    }
+    spacingZ = distances.length > 0 ? median(distances) : spacingZ;
+    if (!Number.isFinite(spacingZ) || spacingZ <= 0) {
+      throw new Error('Не удалось определить положительный шаг между срезами серии.');
+    }
+    if (distances.some((distance) => Math.abs(distance - spacingZ) > Math.max(0.02, spacingZ * 0.02))) {
+      throw new Error('Позиции срезов имеют неравномерный шаг; построение регулярного MPR-объема небезопасно.');
     }
   }
-  if (!first.metadata.SeriesInstanceUID) {
-    throw new Error('В DICOM отсутствует Series Instance UID; безопасно объединить срезы нельзя.');
+
+  // Determine scalar type and allocate one big array
+  const requiresRescale = allFrames.some(f => f.requiresRescale);
+  let scalarType: 'Float32Array' | 'Uint8Array' | 'Int16Array' | 'Uint16Array' = 'Float32Array';
+  if (!requiresRescale) {
+    if (firstFrame.bitsAllocated === 8) {
+      scalarType = firstFrame.signed ? 'Float32Array' : 'Uint8Array';
+       // Fallback for unsupported types if needed, but our worker supports Uint8Array.
+    } else {
+      scalarType = firstFrame.signed ? 'Int16Array' : 'Uint16Array';
+    }
   }
 
-  const normal = [first.direction[6], first.direction[7], first.direction[8]];
-  const sorted = volumes.map((volume) => ({
-    volume,
-    projection: volume.origin[0] * normal[0] +
-      volume.origin[1] * normal[1] +
-      volume.origin[2] * normal[2],
-  })).sort((a, b) => a.projection - b.projection);
+  const voxelCountPerSlice = firstFrame.rows * firstFrame.columns;
+  const totalVoxels = voxelCountPerSlice * allFrames.length;
 
-  const distances = sorted.slice(1).map((item, index) =>
-    item.projection - sorted[index].projection);
-  if (distances.some((distance) => distance <= 0.001)) {
-    throw new Error('В серии есть срезы с совпадающими позициями; корректный MPR-объем построить нельзя.');
-  }
-  const spacingZ = distances.length > 0 ? median(distances) : first.spacing[2];
-  if (!Number.isFinite(spacingZ) || spacingZ <= 0) {
-    throw new Error('Не удалось определить положительный шаг между срезами серии.');
-  }
-  if (distances.some((distance) =>
-    Math.abs(distance - spacingZ) > Math.max(0.02, spacingZ * 0.02))) {
-    throw new Error('Позиции срезов имеют неравномерный шаг; построение регулярного MPR-объема небезопасно.');
-  }
+  const scalarData = scalarType === 'Float32Array' ? new Float32Array(totalVoxels) :
+                     scalarType === 'Uint8Array' ? new Uint8Array(totalVoxels) :
+                     scalarType === 'Int16Array' ? new Int16Array(totalVoxels) :
+                     new Uint16Array(totalVoxels);
 
-  const scalarTypes = new Set(sorted.map(({ volume }) => volume.scalarType));
-  const scalarType = scalarTypes.size === 1
-    ? first.scalarType
-    : 'Float32Array';
-  const voxelCountPerSlice = first.dimensions[0] * first.dimensions[1];
-  const voxelCount = voxelCountPerSlice * sorted.length;
-  const scalarData = scalarType === 'Float32Array'
-    ? new Float32Array(voxelCount)
-    : scalarType === 'Uint8Array'
-      ? new Uint8Array(voxelCount)
-      : scalarType === 'Int16Array'
-        ? new Int16Array(voxelCount)
-        : new Uint16Array(voxelCount);
-  sorted.forEach(({ volume }, index) => {
-    scalarData.set(
-      scalarArray(volume),
-      index * voxelCountPerSlice,
-    );
-  });
+  // Pass 2: Decode frames directly into the allocated array
+  for (let i = 0; i < allFrames.length; i++) {
+    decodeFrame(allFrames[i], scalarData, i);
+    // Explicitly allow GC of buffer reference if this was the last frame from this buffer
+    // For single multi-frame file, this buffer is used multiple times, but GC will collect it later.
+    // For folder of files, the file buffer is used only once.
+  }
 
   return {
-    ...first,
     scalarData: scalarData.buffer,
     scalarType,
-    dimensions: [first.dimensions[0], first.dimensions[1], sorted.length],
-    spacing: [first.spacing[0], first.spacing[1], spacingZ],
-    origin: sorted[0].volume.origin,
-    numberOfFrames: sorted.length,
-    sliceThickness: first.sliceThickness,
+    metadata: firstFrame.volumeInfo.metadata,
+    dimensions: [firstFrame.columns, firstFrame.rows, allFrames.length],
+    spacing: [firstFrame.volumeInfo.spacing[0], firstFrame.volumeInfo.spacing[1], spacingZ],
+    origin: allFrames[0].origin,
+    direction: firstFrame.volumeInfo.direction,
+    sliceThickness: firstFrame.volumeInfo.sliceThickness,
+    numberOfFrames: allFrames.length,
+    windowCenter: firstFrame.volumeInfo.windowCenter,
+    windowWidth: firstFrame.volumeInfo.windowWidth,
+    isMonochrome1: firstFrame.volumeInfo.isMonochrome1,
+    modality: firstFrame.volumeInfo.modality,
     sourceName,
+    patientName: firstFrame.volumeInfo.patientName,
+    patientId: firstFrame.volumeInfo.patientId,
+    studyDate: firstFrame.volumeInfo.studyDate,
+    studyDescription: firstFrame.volumeInfo.studyDescription,
+    seriesDescription: firstFrame.volumeInfo.seriesDescription,
+    manufacturer: firstFrame.volumeInfo.manufacturer,
   };
 }
 
-async function parseFiles(buffers: ArrayBuffer[], sourceName: string): Promise<SerializedDicomVolume> {
-  if (buffers.length === 0) {
-    throw new Error('Не найдены DICOM-файлы для загрузки.');
-  }
-  if (buffers.length === 1) return await parseVolume(buffers[0], sourceName);
-  const volumes: SerializedDicomVolume[] = [];
-  for (const buffer of buffers) {
-    const dataSet = parseDicom(new Uint8Array(buffer));
-    if (dataSet.string(MEDIA_STORAGE_SOP_CLASS_TAG)?.trim() === DICOM_DIRECTORY_STORAGE_UID) {
-      continue;
-    }
-    const volume = await parseVolume(buffer, `срез ${volumes.length + 1}`, dataSet);
-    volumes.push(volume);
-  }
-  if (volumes.length === 0) {
-    throw new Error('В папке найден только DICOMDIR, но нет файлов изображений. Выберите папку целиком, включая вложенную папку IMAGES.');
-  }
-  if (volumes.length === 1) {
-    return {
-      ...volumes[0],
-      sourceName,
-    };
-  }
-  return combineSlices(volumes, sourceName);
-}
+const fileBuffers: ArrayBuffer[] = [];
 
-workerScope.onmessage = async (event: MessageEvent<{ buffers: ArrayBuffer[]; sourceName: string }>) => {
+workerScope.onmessage = async (event: MessageEvent<any>) => {
   try {
-    const result = await parseFiles(event.data.buffers, event.data.sourceName);
-    workerScope.postMessage(result, [result.scalarData]);
+    if (event.data.type === 'file') {
+      fileBuffers.push(event.data.buffer);
+    } else if (event.data.type === 'process') {
+      const result = await parseFiles(fileBuffers, event.data.sourceName);
+      workerScope.postMessage(result, [result.scalarData]);
+      fileBuffers.length = 0; // Clear the buffers
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Не удалось обработать DICOM-файл.';
     workerScope.postMessage({ error: message });
