@@ -1,4 +1,6 @@
-import type { ParsedDicomVolume, ScalarVolumeData, SerializedDicomVolume } from './types';
+import type { ParsedDicomVolume } from './types';
+import * as dicomImageLoader from '@cornerstonejs/dicom-image-loader';
+import * as cornerstone from '@cornerstonejs/core';
 
 export interface ReadProgress {
   loaded: number;
@@ -13,7 +15,7 @@ export function readDicomFile(
   return readDicomFiles([file], onProgress);
 }
 
-export function readDicomFiles(
+export async function readDicomFiles(
   files: File[],
   onProgress: (progress: ReadProgress) => void,
   sourceNameFallback?: string,
@@ -22,101 +24,109 @@ export function readDicomFiles(
     return Promise.reject(new Error('Не выбраны файлы DICOM для загрузки.'));
   }
 
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('./dicomParser.worker.ts', import.meta.url), {
-      type: 'module',
-    });
+  // Generate imageIds by adding files to cornerstone dicom-image-loader fileManager
+  const imageIds: string[] = [];
 
-    const totalSize = files.reduce((total, file) => total + file.size, 0);
-    let completedSize = 0;
-    let currentReader: FileReader | undefined;
-    let settled = false;
+  onProgress({ loaded: 0, total: files.length, stage: 'reading' });
 
-    const cleanUp = () => {
-      settled = true;
-      currentReader?.abort();
-      worker.terminate();
-    };
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const imageId = dicomImageLoader.wadouri.fileManager.add(file);
+    imageIds.push(imageId);
 
-    worker.onerror = (event: ErrorEvent) => {
-      if (settled) return;
-      cleanUp();
-      reject(new Error(`Ошибка DICOM Worker: ${event.message || 'не удалось обработать файл.'}`));
-    };
-    worker.onmessage = (event: MessageEvent<SerializedDicomVolume | { error: string }>) => {
-      if (settled) return;
-      cleanUp();
-      if ('error' in event.data) {
-        reject(new Error(event.data.error));
-        return;
-      }
-      resolve({
-        ...event.data,
-        scalarData: restoreScalarData(event.data.scalarData, event.data.scalarType),
-      });
-    };
-
-    const readNextFile = (index: number) => {
-      if (settled) return;
-      if (index === files.length) {
-        onProgress({ loaded: totalSize, total: totalSize, stage: 'parsing' });
-        const defaultName = files.length === 1 ? files[0].name : (sourceNameFallback || `DICOM серия (${files.length} срезов)`);
-        worker.postMessage({ type: 'process', sourceName: defaultName });
-        return;
-      }
-
-      currentReader = new FileReader();
-      currentReader.onprogress = (event) => {
-        if (event.lengthComputable) {
-          onProgress({
-            loaded: completedSize + event.loaded,
-            total: totalSize,
-            stage: 'reading',
-          });
-        }
-      };
-      currentReader.onerror = () => {
-        if (settled) return;
-        const error = currentReader?.error;
-        cleanUp();
-        reject(error ?? new Error(`Не удалось прочитать локальный файл «${files[index].name}».`));
-      };
-      currentReader.onabort = () => {
-        if (settled) return;
-        cleanUp();
-        reject(new Error(`Чтение локального файла «${files[index].name}» было прервано.`));
-      };
-      currentReader.onload = () => {
-        if (settled) return;
-        if (!(currentReader?.result instanceof ArrayBuffer)) {
-          cleanUp();
-          reject(new Error(`FileReader не вернул ArrayBuffer для файла «${files[index].name}».`));
-          return;
-        }
-        const buffer = currentReader.result;
-        worker.postMessage({ type: 'file', buffer }, [buffer]);
-        completedSize += files[index].size;
-        onProgress({ loaded: completedSize, total: totalSize, stage: 'reading' });
-        readNextFile(index + 1);
-      };
-      currentReader.readAsArrayBuffer(files[index]);
-    };
-
-    readNextFile(0);
-  });
-}
-
-function restoreScalarData(buffer: ArrayBuffer, scalarType: string): ScalarVolumeData {
-  switch (scalarType) {
-    case 'Uint8Array':
-      return new Uint8Array(buffer);
-    case 'Int16Array':
-      return new Int16Array(buffer);
-    case 'Uint16Array':
-      return new Uint16Array(buffer);
-    case 'Float32Array':
-      return new Float32Array(buffer);
-    default:
-      throw new Error(`Worker вернул неподдерживаемый тип пикселей: ${scalarType}.`);
+    // Simulate some progress reporting per file added
+    if (i % 10 === 0 || i === files.length - 1) {
+       onProgress({ loaded: i + 1, total: files.length, stage: 'reading' });
+    }
   }
+
+  onProgress({ loaded: files.length, total: files.length, stage: 'parsing' });
+
+  try {
+    // Pre-load all images to populate cornerstone metadata for local files
+    // This is required for createAndCacheVolume to correctly compute volume dimensions.
+    // We process them in batches to prevent UI freezing and memory spikes.
+    const batchSize = 10;
+    for (let i = 0; i < imageIds.length; i += batchSize) {
+      const batch = imageIds.slice(i, i + batchSize);
+      await Promise.all(batch.map((id) => cornerstone.imageLoader.loadAndCacheImage(id)));
+      onProgress({ loaded: i + batch.length, total: imageIds.length, stage: 'parsing' });
+    }
+  } catch (error) {
+    console.warn("Failed to load and cache some DICOM files", error);
+  }
+
+  // Sort imageIds anatomically by projection along their normal vector
+  const imageIdsWithProjection = imageIds.map((imageId) => {
+    const imagePlane = cornerstone.metaData.get('imagePlaneModule', imageId);
+    if (!imagePlane || !imagePlane.imagePositionPatient || !imagePlane.rowCosines || !imagePlane.columnCosines) {
+      return { imageId, projection: 0, imagePlane };
+    }
+    const [ippX, ippY, ippZ] = imagePlane.imagePositionPatient;
+    const [rX, rY, rZ] = imagePlane.rowCosines;
+    const [cX, cY, cZ] = imagePlane.columnCosines;
+    // Calculate normal vector (cross product of row and column)
+    const nX = rY * cZ - rZ * cY;
+    const nY = rZ * cX - rX * cZ;
+    const nZ = rX * cY - rY * cX;
+
+    // Projection of IPP onto normal
+    const projection = ippX * nX + ippY * nY + ippZ * nZ;
+    return { imageId, projection, imagePlane };
+  });
+
+  // Sort the array by projection
+  imageIdsWithProjection.sort((a, b) => a.projection - b.projection);
+  const sortedImageIds = imageIdsWithProjection.map(item => item.imageId);
+
+  // Extract basic display metadata from the first image
+  let patientName = '';
+  let patientId = '';
+  let studyDate = '';
+  let studyDescription = '';
+  let seriesDescription = '';
+  let manufacturer = '';
+  let modality = 'CT';
+
+  try {
+    const patientModule = cornerstone.metaData.get('patientModule', sortedImageIds[0]);
+    if (patientModule) {
+      patientName = patientModule.patientName?.Alphabetic || patientModule.patientName || '';
+      patientId = patientModule.patientId || '';
+    }
+
+    const generalStudyModule = cornerstone.metaData.get('generalStudyModule', sortedImageIds[0]);
+    if (generalStudyModule) {
+      studyDate = generalStudyModule.studyDate || '';
+      studyDescription = generalStudyModule.studyDescription || '';
+    }
+
+    const generalSeriesModule = cornerstone.metaData.get('generalSeriesModule', sortedImageIds[0]);
+    if (generalSeriesModule) {
+      modality = generalSeriesModule.modality || 'CT';
+      seriesDescription = generalSeriesModule.seriesDescription || '';
+    }
+
+    const generalEquipmentModule = cornerstone.metaData.get('generalEquipmentModule', sortedImageIds[0]);
+    if (generalEquipmentModule) {
+      manufacturer = generalEquipmentModule.manufacturer || '';
+    }
+
+  } catch (error) {
+    console.warn("Failed to extract metadata from the first DICOM file", error);
+  }
+
+  const defaultName = files.length === 1 ? files[0].name : (sourceNameFallback || `DICOM серия (${files.length} срезов)`);
+
+  return {
+    imageIds: sortedImageIds,
+    modality,
+    sourceName: defaultName,
+    patientName,
+    patientId,
+    studyDate,
+    studyDescription,
+    seriesDescription,
+    manufacturer,
+  };
 }
