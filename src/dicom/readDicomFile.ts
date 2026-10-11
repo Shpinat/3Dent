@@ -1,6 +1,7 @@
 import type { ParsedDicomVolume } from './types';
 import * as dicomImageLoader from '@cornerstonejs/dicom-image-loader';
 import * as cornerstone from '@cornerstonejs/core';
+import { initializeCornerstone } from '../cornerstone';
 
 export interface ReadProgress {
   loaded: number;
@@ -23,6 +24,8 @@ export async function readDicomFiles(
   if (files.length === 0) {
     return Promise.reject(new Error('Не выбраны файлы DICOM для загрузки.'));
   }
+
+  await initializeCornerstone();
 
   // Generate imageIds by adding files to cornerstone dicom-image-loader fileManager
   const imageIds: string[] = [];
