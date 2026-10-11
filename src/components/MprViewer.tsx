@@ -5,9 +5,10 @@ import type { ParsedDicomVolume } from '../dicom/types';
 import { initializeCornerstone } from '../cornerstone';
 
 const VIEWPORTS = [
-  { id: 'axial', label: 'Axial', orientation: cornerstone.Enums.OrientationAxis.AXIAL },
-  { id: 'sagittal', label: 'Sagittal', orientation: cornerstone.Enums.OrientationAxis.SAGITTAL },
-  { id: 'coronal', label: 'Coronal', orientation: cornerstone.Enums.OrientationAxis.CORONAL },
+  { id: 'axial', label: 'Axial', orientation: cornerstone.Enums.OrientationAxis.AXIAL, type: cornerstone.Enums.ViewportType.ORTHOGRAPHIC },
+  { id: 'sagittal', label: 'Sagittal', orientation: cornerstone.Enums.OrientationAxis.SAGITTAL, type: cornerstone.Enums.ViewportType.ORTHOGRAPHIC },
+  { id: 'coronal', label: 'Coronal', orientation: cornerstone.Enums.OrientationAxis.CORONAL, type: cornerstone.Enums.ViewportType.ORTHOGRAPHIC },
+  { id: 'volume3d', label: '3D Render', orientation: cornerstone.Enums.OrientationAxis.CORONAL, type: cornerstone.Enums.ViewportType.VOLUME_3D },
 ] as const;
 
 function isPoint3(point: unknown): point is cornerstone.Types.Point3 {
@@ -81,7 +82,7 @@ function createSynchronizedWindowLevelTool(
         if (!voiRange) return;
         for (const viewport of viewports) {
           if (viewport === sourceViewport) continue;
-          viewport.setProperties({ voiRange, VOILUTFunction }, undefined, true);
+          if ('setProperties' in viewport) { (viewport as cornerstone.VolumeViewport).setProperties({ voiRange, VOILUTFunction }); }
           viewport.render();
         }
       };
@@ -103,6 +104,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
     let disposed = false;
     let renderingEngine: cornerstone.RenderingEngine | undefined;
     let toolGroupId: string | undefined;
+    let toolGroup3D: any;
     let volumeId: string | undefined;
     let localImageMetadataProvider:
       | ((type: string, ...queries: unknown[]) => unknown)
@@ -122,16 +124,18 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
         volumeId = `local:dicom-volume-${suffix}`;
         renderingEngine = new cornerstone.RenderingEngine(renderingEngineId);
 
-        const viewportInputs = VIEWPORTS.map(({ id, orientation }) => {
+        const viewportInputs = VIEWPORTS.map(({ id, orientation, type }) => {
           const element = elementRefs.current[id];
           if (!element) throw new Error(`Не найдено окно ${id} для рендеринга.`);
           return {
             viewportId: id,
-            type: cornerstone.Enums.ViewportType.ORTHOGRAPHIC,
+            type,
             element,
             defaultOptions: {
               orientation,
-              background: [0.025, 0.035, 0.05] as [number, number, number],
+              background: type === cornerstone.Enums.ViewportType.VOLUME_3D
+                ? [0.1, 0.1, 0.1] as [number, number, number]
+                : [0.025, 0.035, 0.05] as [number, number, number],
             },
           };
         });
@@ -198,49 +202,70 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
 
         const viewports = VIEWPORTS.map(({ id }) => {
           const viewport = renderingEngine!.getViewport(id);
-          if (!(viewport instanceof cornerstone.VolumeViewport)) {
-            throw new Error(`Окно ${id} не является Volume Viewport.`);
+          if (!(viewport instanceof cornerstone.VolumeViewport) && viewport.type !== cornerstone.Enums.ViewportType.VOLUME_3D) {
+            throw new Error(`Окно ${id} не является Volume/3D Viewport.`);
           }
           return viewport;
         });
-        await Promise.all(viewports.map((viewport) => viewport.setVolumes([{ volumeId: volumeId! }])));
+
+        await Promise.all(viewports.map(async (viewport) => {
+           if (viewport.type === cornerstone.Enums.ViewportType.VOLUME_3D) {
+             await (viewport as cornerstone.Types.IVolumeViewport).setVolumes([{
+               volumeId: volumeId!,
+               blendMode: cornerstone.Enums.BlendModes.MAXIMUM_INTENSITY_BLEND
+             }]);
+           } else {
+             await (viewport as cornerstone.Types.IVolumeViewport).setVolumes([{ volumeId: volumeId! }]);
+           }
+        }));
         for (const viewport of viewports) {
-          viewport.setProperties({
-            voiRange: {
-              lower: volume.windowCenter - volume.windowWidth / 2,
-              upper: volume.windowCenter + volume.windowWidth / 2,
-            },
-            invert: volume.isMonochrome1,
-          });
+          if ('setProperties' in viewport) {
+            (viewport as cornerstone.VolumeViewport).setProperties({
+              voiRange: {
+                lower: volume.windowCenter - volume.windowWidth / 2,
+                upper: volume.windowCenter + volume.windowWidth / 2,
+              },
+              invert: volume.isMonochrome1,
+            });
+          }
         }
 
-        const SynchronizedWindowLevelTool = createSynchronizedWindowLevelTool(
-          viewports,
-          `WindowLevel-${suffix}`,
-        );
+        const SynchronizedWindowLevelTool = createSynchronizedWindowLevelTool(viewports.filter(v => v instanceof cornerstone.VolumeViewport) as cornerstone.VolumeViewport[], `WindowLevel-${suffix}`);
         cornerstoneTools.addTool(CursorCrosshairsTool);
         cornerstoneTools.addTool(SynchronizedWindowLevelTool);
         cornerstoneTools.addTool(cornerstoneTools.PanTool);
         cornerstoneTools.addTool(cornerstoneTools.ZoomTool);
         const toolGroup = cornerstoneTools.ToolGroupManager.createToolGroup(toolGroupId);
-        if (!toolGroup) throw new Error('Не удалось создать группу инструментов Cornerstone.');
-        for (const { id } of VIEWPORTS) toolGroup.addViewport(id, renderingEngineId);
+        const toolGroup3D = cornerstoneTools.ToolGroupManager.createToolGroup(toolGroupId + '-3d');
+
+        if (!toolGroup || !toolGroup3D) throw new Error('Не удалось создать группу инструментов Cornerstone.');
+
+        cornerstoneTools.addTool(cornerstoneTools.TrackballRotateTool);
+
+        for (const { id, type } of VIEWPORTS) {
+          if (type === cornerstone.Enums.ViewportType.VOLUME_3D) {
+            toolGroup3D.addViewport(id, renderingEngineId);
+          } else {
+            toolGroup.addViewport(id, renderingEngineId);
+          }
+        }
+
+        // Setup 2D MPR Tools
         toolGroup.addTool(CursorCrosshairsTool.toolName);
         toolGroup.addTool(SynchronizedWindowLevelTool.toolName);
         toolGroup.addTool(cornerstoneTools.PanTool.toolName);
         toolGroup.addTool(cornerstoneTools.ZoomTool.toolName);
-        toolGroup.setToolActive(CursorCrosshairsTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Primary }],
-        });
-        toolGroup.setToolActive(SynchronizedWindowLevelTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Secondary }],
-        });
-        toolGroup.setToolActive(cornerstoneTools.PanTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Auxiliary }],
-        });
-        toolGroup.setToolActive(cornerstoneTools.ZoomTool.toolName, {
-          bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Wheel }],
-        });
+        toolGroup.setToolActive(CursorCrosshairsTool.toolName, { bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Primary }] });
+        toolGroup.setToolActive(SynchronizedWindowLevelTool.toolName, { bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Secondary }] });
+        toolGroup.setToolActive(cornerstoneTools.PanTool.toolName, { bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Auxiliary }] });
+        toolGroup.setToolActive(cornerstoneTools.ZoomTool.toolName, { bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Wheel }] });
+
+        // Setup 3D Tools
+        toolGroup3D.addTool(cornerstoneTools.TrackballRotateTool.toolName);
+        toolGroup3D.addTool(cornerstoneTools.ZoomTool.toolName);
+        toolGroup3D.setToolActive(cornerstoneTools.TrackballRotateTool.toolName, { bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Primary }] });
+        toolGroup3D.setToolActive(cornerstoneTools.ZoomTool.toolName, { bindings: [{ mouseButton: cornerstoneTools.Enums.MouseBindings.Wheel }] });
+
 
         renderingEngine.render();
         resizeObserver = new ResizeObserver(() => renderingEngine?.resize(true, true));
@@ -271,6 +296,12 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
           VIEWPORTS.forEach(({ id }) => toolGroup.removeViewports(renderingEngineId, id));
         }
         cornerstoneTools.ToolGroupManager.destroyToolGroup(toolGroupId);
+        if (toolGroup3D) {
+          VIEWPORTS.forEach(({ id }) => {
+            try { toolGroup3D.removeViewports(renderingEngineId, id); } catch(e){}
+          });
+          cornerstoneTools.ToolGroupManager.destroyToolGroup(toolGroupId + '-3d');
+        }
       }
 
       if (renderingEngine) {
@@ -288,12 +319,12 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
 
   return (
     <section className="mpr-grid" aria-label="Мультипланарная реконструкция">
-      {VIEWPORTS.map(({ id, label }) => (
+      {VIEWPORTS.map(({ id, label, type }) => (
         <article className="viewport-card" key={id}>
           <header className="viewport-heading">
             <span className={`plane-dot plane-dot--${id}`} />
             <h2>{label}</h2>
-            <span className="viewport-hint">MPR</span>
+            <span className="viewport-hint">{type === cornerstone.Enums.ViewportType.VOLUME_3D ? '3D' : 'MPR'}</span>
           </header>
           <div
             className="viewport-canvas"
