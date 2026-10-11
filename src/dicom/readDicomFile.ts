@@ -45,22 +45,41 @@ export async function readDicomFiles(
 
   onProgress({ loaded: files.length, total: files.length, stage: 'parsing' });
 
-  try {
-    // Pre-load all images to populate cornerstone metadata for local files
-    // This is required for createAndCacheVolume to correctly compute volume dimensions.
-    // We process them in batches to prevent UI freezing and memory spikes.
-    const batchSize = 10;
-    for (let i = 0; i < imageIds.length; i += batchSize) {
-      const batch = imageIds.slice(i, i + batchSize);
-      await Promise.all(batch.map((id) => cornerstone.imageLoader.loadAndCacheImage(id)));
-      onProgress({ loaded: i + batch.length, total: imageIds.length, stage: 'parsing' });
-    }
-  } catch (error) {
-    console.warn("Failed to load and cache some DICOM files", error);
+  const validImageIds: string[] = [];
+  let parsedCount = 0;
+
+  for (let i = 0; i < imageIds.length; i++) {
+      const imageId = imageIds[i];
+      try {
+         // Load just the dataset to populate metadata without decoding pixel data to save memory
+         const parsedImageId = dicomImageLoader.wadouri.parseImageId(imageId);
+         const loadFileRequest = dicomImageLoader.wadouri.getLoaderForScheme(parsedImageId.scheme);
+         await dicomImageLoader.wadouri.dataSetCacheManager.load(parsedImageId.url, loadFileRequest, imageId);
+
+         const pixelModule = cornerstone.metaData.get('imagePixelModule', imageId);
+         const planeModule = cornerstone.metaData.get('imagePlaneModule', imageId);
+
+         if (pixelModule && planeModule && pixelModule.pixelRepresentation !== undefined) {
+            validImageIds.push(imageId);
+         } else {
+            console.warn(`Missing required DICOM metadata for ${imageId}`);
+         }
+      } catch (error) {
+         console.warn("Failed to load metadata for", imageId, error);
+      }
+
+      parsedCount++;
+      if (parsedCount % 10 === 0 || parsedCount === imageIds.length) {
+          onProgress({ loaded: parsedCount, total: imageIds.length, stage: 'parsing' });
+      }
+  }
+
+  if (validImageIds.length === 0) {
+     throw new Error('Не удалось найти корректные DICOM-файлы с пиксельными данными и пространственной информацией.');
   }
 
   // Sort imageIds anatomically by projection along their normal vector
-  const imageIdsWithProjection = imageIds.map((imageId) => {
+  const imageIdsWithProjection = validImageIds.map((imageId) => {
     const imagePlane = cornerstone.metaData.get('imagePlaneModule', imageId);
     if (!imagePlane || !imagePlane.imagePositionPatient || !imagePlane.rowCosines || !imagePlane.columnCosines) {
       return { imageId, projection: 0, imagePlane };
