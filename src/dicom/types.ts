@@ -1,19 +1,5 @@
-import type { Types } from '@cornerstonejs/core';
-
-export type ScalarVolumeData = Int16Array | Uint16Array | Uint8Array | Float32Array;
-
 export interface ParsedDicomVolume {
-  scalarData: ScalarVolumeData;
-  metadata: Types.Metadata;
-  dimensions: Types.Point3;
-  spacing: Types.Point3;
-  origin: Types.Point3;
-  direction: Types.Mat3;
-  sliceThickness: number;
-  numberOfFrames: number;
-  windowCenter: number;
-  windowWidth: number;
-  isMonochrome1: boolean;
+  imageIds: string[];
   modality: string;
   sourceName: string;
   patientName?: string;
@@ -22,9 +8,4 @@ export interface ParsedDicomVolume {
   studyDescription?: string;
   seriesDescription?: string;
   manufacturer?: string;
-}
-
-export interface SerializedDicomVolume extends Omit<ParsedDicomVolume, 'scalarData'> {
-  scalarData: ArrayBuffer;
-  scalarType: 'Int16Array' | 'Uint16Array' | 'Uint8Array' | 'Float32Array';
 }
