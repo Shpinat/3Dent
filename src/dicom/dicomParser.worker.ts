@@ -98,41 +98,41 @@ function decodeString(dataSet: DataSet, tag: string): string | undefined {
   // Remove formatting caret delimiters (e.g. Last^First -> Last First)
   cleaned = cleaned.replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // 1. Try to read directly from raw bytes using windows-1251 decoder.
-  // This bypasses dicom-parser's internal string decoding which corrupts some Russian charsets.
   try {
     const bytes = new Uint8Array(dataSet.byteArray.buffer, dataSet.byteArray.byteOffset + element.dataOffset, element.length);
+
     const decoder1251 = new TextDecoder('windows-1251');
     const decoded1251 = decoder1251.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
 
-    // Check if the result looks like valid Cyrillic
-    if (/[А-Яа-я]/.test(decoded1251) && !/[À-ßà-ÿЁёЮЫЮФШЭ]/.test(decoded1251)) {
-      return decoded1251;
+    const decoder8859_5 = new TextDecoder('iso-8859-5');
+    const decoded8859_5 = decoder8859_5.decode(bytes).replace(/\0/g, '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim();
+
+    const countCyrillic = (str: string) => (str.match(/[А-Яа-яЁё]/g) || []).length;
+    // When ISO-8859-5 is decoded as CP1251, it often produces these characters: І, °, Ї, Є, Ґ
+    const countWeird = (str: string) => (str.match(/[ІіЇїЄєҐґ°]/g) || []).length;
+
+    const c1251 = countCyrillic(decoded1251);
+    const w1251 = countWeird(decoded1251);
+
+    const c8859 = countCyrillic(decoded8859_5);
+    const w8859 = countWeird(decoded8859_5);
+
+    if (c8859 > 0 && w8859 === 0 && (w1251 > 0 || c8859 > c1251)) {
+       return decoded8859_5;
     }
+
+    if (c1251 > 0 && w1251 === 0) {
+       return decoded1251;
+    }
+
+    if (c8859 > 0 && w8859 < w1251) return decoded8859_5;
+    if (c1251 > 0) return decoded1251;
+
   } catch (error) {
     // ignore byte reading errors
   }
 
-  // 2. Fallback: Check if dicom-parser's string looks like Cyrillic moji-bake and try character code extraction
-  const hasCyrillicMojiBake = /[À-ßà-ÿЁёЮЫЮФШЭ]/.test(cleaned);
-  if (hasCyrillicMojiBake) {
-    try {
-      const bytes = new Uint8Array(cleaned.length);
-      for (let i = 0; i < cleaned.length; i++) {
-        bytes[i] = cleaned.charCodeAt(i) & 0xFF;
-      }
-
-      const decoder = new TextDecoder('windows-1251');
-      const decoded = decoder.decode(bytes);
-
-      if (/[А-Яа-я]/.test(decoded)) {
-        return decoded.trim();
-      }
-    } catch {
-      // Fallback to original
-    }
-  }
-
+  // Fallback to original
   return cleaned;
 }
 
@@ -664,6 +664,7 @@ workerScope.onmessage = async (event: MessageEvent<any>) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Не удалось обработать DICOM-файл.';
     workerScope.postMessage({ error: message });
+    fileBuffers.length = 0;
   }
 };
 
