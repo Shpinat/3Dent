@@ -26,7 +26,7 @@ export function readDicomFiles(
     const worker = new Worker(new URL('./dicomParser.worker.ts', import.meta.url), {
       type: 'module',
     });
-    const buffers: ArrayBuffer[] = [];
+
     const totalSize = files.reduce((total, file) => total + file.size, 0);
     let completedSize = 0;
     let currentReader: FileReader | undefined;
@@ -61,13 +61,7 @@ export function readDicomFiles(
       if (index === files.length) {
         onProgress({ loaded: totalSize, total: totalSize, stage: 'parsing' });
         const defaultName = files.length === 1 ? files[0].name : (sourceNameFallback || `DICOM серия (${files.length} срезов)`);
-        worker.postMessage(
-          {
-            buffers,
-            sourceName: defaultName,
-          },
-          buffers,
-        );
+        worker.postMessage({ type: 'process', sourceName: defaultName });
         return;
       }
 
@@ -99,7 +93,8 @@ export function readDicomFiles(
           reject(new Error(`FileReader не вернул ArrayBuffer для файла «${files[index].name}».`));
           return;
         }
-        buffers.push(currentReader.result);
+        const buffer = currentReader.result;
+        worker.postMessage({ type: 'file', buffer }, [buffer]);
         completedSize += files[index].size;
         onProgress({ loaded: completedSize, total: totalSize, stage: 'reading' });
         readNextFile(index + 1);
