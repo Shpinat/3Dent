@@ -9,7 +9,7 @@ export function initializeCornerstone(): Promise<void> {
     initialization = Promise.resolve().then(() => {
       cornerstone.init();
       cornerstoneTools.init();
-      dicomImageLoader.init();
+      dicomImageLoader.init({ useLegacyMetadataProvider: true });
       cornerstone.registerImageLoader('local', (imageId) => {
         const image = cornerstone.cache.getImage(imageId);
         if (!image) {
