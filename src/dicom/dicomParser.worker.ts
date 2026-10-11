@@ -440,7 +440,11 @@ function extractVolumeInfo(
       pixelRepresentation,
       signed,
       pixelElement,
-      projection: desc.projection ?? 0,
+      projection: desc.projection ?? (
+        (desc.position || rootPosition)
+          ? ((desc.position || rootPosition)![0] * normal[0] + (desc.position || rootPosition)![1] * normal[1] + (desc.position || rootPosition)![2] * normal[2])
+          : 0
+      ),
       rows,
       columns,
       bytesPerPixel,
@@ -657,9 +661,12 @@ workerScope.onmessage = async (event: MessageEvent<any>) => {
     if (event.data.type === 'file') {
       fileBuffers.push(event.data.buffer);
     } else if (event.data.type === 'process') {
-      const result = await parseFiles(fileBuffers, event.data.sourceName);
-      workerScope.postMessage(result, [result.scalarData]);
-      fileBuffers.length = 0; // Clear the buffers
+      try {
+        const result = await parseFiles(fileBuffers, event.data.sourceName);
+        workerScope.postMessage(result, [result.scalarData]);
+      } finally {
+        fileBuffers.length = 0; // Always clear the buffers
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Не удалось обработать DICOM-файл.';
