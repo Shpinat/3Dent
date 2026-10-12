@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as cornerstone from '@cornerstonejs/core';
 import * as cornerstoneTools from '@cornerstonejs/tools';
+import * as dicomImageLoader from '@cornerstonejs/dicom-image-loader';
 import type { ParsedDicomVolume } from '../dicom/types';
 import { initializeCornerstone } from '../cornerstone';
 
@@ -259,6 +260,12 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
       if (volumeId && cornerstone.cache.getVolume(volumeId)) {
         cornerstone.cache.removeVolumeLoadObject(volumeId);
       }
+
+      try {
+         // Free memory for loaded datasets in dicom-image-loader
+         dicomImageLoader.wadouri.dataSetCacheManager.purge();
+      } catch(e) {}
+
 
       // Critical for 180MB files: completely purge cache and WebGL textures
       cornerstone.cache.purgeCache();
