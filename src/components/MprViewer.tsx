@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as cornerstone from '@cornerstonejs/core';
 import * as cornerstoneTools from '@cornerstonejs/tools';
+import * as dicomImageLoader from '@cornerstonejs/dicom-image-loader';
 import type { ParsedDicomVolume } from '../dicom/types';
 import { initializeCornerstone } from '../cornerstone';
 
@@ -106,9 +107,6 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
     let toolGroupId: string | undefined;
     let toolGroup3D: any;
     let volumeId: string | undefined;
-    let localImageMetadataProvider:
-      | ((type: string, ...queries: unknown[]) => unknown)
-      | undefined;
     let resizeObserver: ResizeObserver | undefined;
 
     const suffix = crypto.randomUUID();
@@ -121,7 +119,7 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
         if (disposed) return;
 
         toolGroupId = `mpr-tools-${suffix}`;
-        volumeId = `local:dicom-volume-${suffix}`;
+        volumeId = `cornerstoneStreamingImageVolume:local-dicom-volume-${suffix}`;
         renderingEngine = new cornerstone.RenderingEngine(renderingEngineId);
 
         const viewportInputs = VIEWPORTS.map(({ id, orientation, type }) => {
@@ -142,63 +140,12 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
         renderingEngine.setViewports(viewportInputs);
 
         onStatus('Создание 3D-объема…', 96);
-        const volumeObject = cornerstone.volumeLoader.createLocalVolume(volumeId, {
-          metadata: volume.metadata,
-          dimensions: volume.dimensions,
-          spacing: volume.spacing,
-          origin: volume.origin,
-          direction: volume.direction,
-          scalarData: volume.scalarData,
+        const volumeObject = await cornerstone.volumeLoader.createAndCacheVolume(volumeId, {
+          imageIds: volume.imageIds,
         });
-        if (!volumeObject) throw new Error('Cornerstone не создал локальный том.');
-        const imageIds = volumeObject.imageIds;
-        if (!imageIds || imageIds.length !== volume.numberOfFrames) {
-          throw new Error('Cornerstone не создал метаданные для всех срезов тома.');
-        }
-        const rowCosines: cornerstone.Types.Point3 = [
-          volume.direction[0],
-          volume.direction[1],
-          volume.direction[2],
-        ];
-        const columnCosines: cornerstone.Types.Point3 = [
-          volume.direction[3],
-          volume.direction[4],
-          volume.direction[5],
-        ];
-        const normal = volume.direction.slice(6, 9);
-        const imagePlaneMetadata = new Map<string, cornerstone.Types.ImagePlaneModule>();
-        imageIds.forEach((imageId, index) => {
-          const imagePositionPatient: [number, number, number] = [
-            volume.origin[0] + normal[0] * volume.spacing[2] * index,
-            volume.origin[1] + normal[1] * volume.spacing[2] * index,
-            volume.origin[2] + normal[2] * volume.spacing[2] * index,
-          ];
-          imagePlaneMetadata.set(imageId, {
-            frameOfReferenceUID: volume.metadata.FrameOfReferenceUID,
-            rows: volume.dimensions[1],
-            columns: volume.dimensions[0],
-            rowCosines,
-            columnCosines,
-            imageOrientationPatient: volume.metadata.ImageOrientationPatient,
-            imagePositionPatient,
-            pixelSpacing: [volume.spacing[1], volume.spacing[0]],
-            rowPixelSpacing: volume.spacing[1],
-            columnPixelSpacing: volume.spacing[0],
-            sliceThickness: volume.sliceThickness,
-            spacingBetweenSlices: volume.spacing[2],
-            sliceLocation: imagePositionPatient[0] * normal[0] +
-              imagePositionPatient[1] * normal[1] +
-              imagePositionPatient[2] * normal[2],
-          });
-        });
-        localImageMetadataProvider = (type, ...queries) => {
-          const imageId = queries[0];
-          if (type !== cornerstone.Enums.MetadataModules.IMAGE_PLANE || typeof imageId !== 'string') {
-            return undefined;
-          }
-          return imagePlaneMetadata.get(imageId);
-        };
-        cornerstone.metaData.addProvider(localImageMetadataProvider, 1000);
+        if (!volumeObject) throw new Error('Cornerstone не создал том из файлов.');
+
+        await volumeObject.load();
 
         const viewports = VIEWPORTS.map(({ id }) => {
           const viewport = renderingEngine!.getViewport(id);
@@ -218,15 +165,21 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
              await (viewport as cornerstone.Types.IVolumeViewport).setVolumes([{ volumeId: volumeId! }]);
            }
         }));
-        for (const viewport of viewports) {
-          if ('setProperties' in viewport) {
-            (viewport as cornerstone.VolumeViewport).setProperties({
-              voiRange: {
-                lower: volume.windowCenter - volume.windowWidth / 2,
-                upper: volume.windowCenter + volume.windowWidth / 2,
-              },
-              invert: volume.isMonochrome1,
-            });
+
+        // Setup initial Window/Level from metadata
+        const imagePlane = cornerstone.metaData.get('voiLutModule', volume.imageIds[0]);
+        if (imagePlane && imagePlane.windowWidth && imagePlane.windowCenter) {
+          const windowWidth = Array.isArray(imagePlane.windowWidth) ? imagePlane.windowWidth[0] : imagePlane.windowWidth;
+          const windowCenter = Array.isArray(imagePlane.windowCenter) ? imagePlane.windowCenter[0] : imagePlane.windowCenter;
+          const lower = windowCenter - windowWidth / 2;
+          const upper = windowCenter + windowWidth / 2;
+
+          for (const viewport of viewports) {
+            if ('setProperties' in viewport) {
+              (viewport as cornerstone.VolumeViewport).setProperties({
+                voiRange: { lower, upper },
+              });
+            }
           }
         }
 
@@ -285,10 +238,6 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
     return () => {
       disposed = true;
       resizeObserver?.disconnect();
-      
-      if (localImageMetadataProvider) {
-        cornerstone.metaData.removeProvider(localImageMetadataProvider);
-      }
 
       if (toolGroupId) {
         const toolGroup = cornerstoneTools.ToolGroupManager.getToolGroup(toolGroupId);
@@ -311,6 +260,12 @@ export function MprViewer({ volume, onStatus, onReady, onError }: MprViewerProps
       if (volumeId && cornerstone.cache.getVolume(volumeId)) {
         cornerstone.cache.removeVolumeLoadObject(volumeId);
       }
+
+      try {
+         // Free memory for loaded datasets in dicom-image-loader
+         dicomImageLoader.wadouri.dataSetCacheManager.purge();
+      } catch(e) {}
+
 
       // Critical for 180MB files: completely purge cache and WebGL textures
       cornerstone.cache.purgeCache();
