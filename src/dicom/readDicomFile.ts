@@ -56,16 +56,10 @@ export async function readDicomFiles(
          const loadFileRequest = dicomImageLoader.wadouri.getLoaderForScheme(parsedImageId.scheme);
          await dicomImageLoader.wadouri.dataSetCacheManager.load(parsedImageId.url, loadFileRequest, imageId);
 
-         // Ensure fallback provider is working and patch missing properties
          const pixelModule = cornerstone.metaData.get('imagePixelModule', imageId);
          const planeModule = cornerstone.metaData.get('imagePlaneModule', imageId);
-         const seriesModule = cornerstone.metaData.get('generalSeriesModule', imageId);
 
-         if (pixelModule && planeModule && seriesModule) {
-            // Hotfix for color images where pixelRepresentation is omitted
-            if (pixelModule.pixelRepresentation === undefined) {
-                pixelModule.pixelRepresentation = 0;
-            }
+         if (pixelModule && planeModule && pixelModule.pixelRepresentation !== undefined) {
             validImageIds.push(imageId);
          } else {
             console.warn(`Missing required DICOM metadata for ${imageId}`);
