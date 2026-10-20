@@ -1,35 +1,32 @@
-# 3Dent MPR Viewer
+# React + TypeScript + Vite
 
-Локальное React/Vite-приложение для просмотра CT DICOM в трех ортогональных плоскостях. Можно открыть один multi-frame файл или папку с отдельными срезами. В браузере используются Cornerstone3D Volume Viewport и WebGL; файлы на сервер не отправляются.
+This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 
-## Запуск
+Currently, two official plugins are available:
 
-```sh
-npm ci
-npm run dev
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the Oxlint configuration
+
+If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+
+```json
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc"],
+  "options": {
+    "typeAware": true
+  },
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+  }
+}
 ```
 
-Для проверки production-сборки:
-
-```sh
-npm run build
-npm run preview
-```
-
-Точные версии зависимостей зафиксированы в `package.json` и `package-lock.json`.
-
-## Загрузка и реконструкция
-
-1. Выберите файл/папку кнопкой или перетащите их в окно. В папках файлы отбираются по сигнатуре `DICM` на смещении 128, поэтому имена и расширения не используются для определения формата. Служебный `DICOMDIR` пропускается; если он находится рядом с изображениями, загрузите родительскую папку целиком.
-2. `FileReader.readAsArrayBuffer` читает файлы и передает прогресс в интерфейс. `dicomParser.worker.ts` разбирает `NumberOfFrames`, `Rows`, `Columns`, `PixelSpacing`, `SliceThickness`, геометрию функциональных групп и Pixel Data.
-3. Для папки с отдельными одно-кадровыми файлами кадры сортируются по `ImagePositionPatient` относительно нормали изображения. Проверяются серия, Frame of Reference, ориентация, размеры, spacing и равномерность шага; несовместимые или неравномерные срезы отклоняются вместо создания геометрически неверного объема. Modality rescale из shared/per-frame functional groups применяется к соответствующим кадрам.
-4. `createLocalVolume` создает единый Cornerstone volume. Для локальных срезов зарегистрирован cache-backed image loader и геометрия каждого кадра. Три `ORTHOGRAPHIC` Volume Viewport показывают Axial, Sagittal и Coronal; `CrosshairsTool` синхронизирует положение среза.
-
-Основной сценарий рассчитан на одну монохромную CT-серию с несжатым Pixel Data и transfer syntax Explicit VR Little Endian или Implicit VR Little Endian, 8- или 16-битными пикселями и одним sample на pixel. Сжатые/инкапсулированные данные и цветные изображения явно отклоняются: для них потребуется отдельный путь декодирования кадров. Формат DICOM с сигнатурой `DICM` в стандартной позиции 128 байт обязателен. Если в папке несколько DICOM-серий, их нужно разделить перед загрузкой.
-
-## Управление в MPR
-
-- ЛКМ — перекрестие и синхронная смена позиции во всех плоскостях.
-- ПКМ + перетаскивание — Window/Level синхронно во всех трех окнах.
-- Средняя кнопка мыши + перетаскивание — Pan.
-- Колесико мыши — Zoom.
+See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
